@@ -179,8 +179,7 @@ class TestTinygrad(unittest.TestCase):
     def test_tinygrad():
       w1 = Tensor(init)
       w2 = Tensor(init)
-      assert w1.requires_grad is None and w2.requires_grad is None
-      # optimizer sets requires_grad=True for params with requires_grad=None
+      assert w1.requires_grad is True and w2.requires_grad is True
       nn.optim.SGD([w1, w2], lr=0.01)
       assert w1.requires_grad is True and w2.requires_grad is True
       out = w1.add(w2)
@@ -259,6 +258,13 @@ class TestTinygrad(unittest.TestCase):
     np.testing.assert_equal(a.numpy(), [8, 9, 4, 3, 6, 1, 7, 5, 2, 0])
     b = Tensor.randperm(1000).realize()
     np.testing.assert_equal(set(b.numpy()), set(range(1000)))
+
+  def test_rand_rejects_unknown_kwargs(self):
+    with self.assertRaises(TypeError): Tensor.rand(5, generator="foo")
+
+  def test_randperm_requires_grad(self):
+    self.assertIs(Tensor.randperm(5, requires_grad=True).requires_grad, True)
+    self.assertIs(Tensor.randperm(5, requires_grad=False).requires_grad, False)
 
   def test_randn_isnt_inf_on_zero(self):
     # simulate failure case of rand handing a zero to randn

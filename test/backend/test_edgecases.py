@@ -27,10 +27,10 @@ import numpy as np
 import torch
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.device import Device
-from tinygrad.helpers import getenv
+from tinygrad.helpers import DEV
 from tinygrad.renderer.nir import NIRRenderer
 
-MOCKGPU = getenv("MOCKGPU")
+MOCKGPU = DEV.interface.startswith("MOCK")
 
 class TestNaNEdgeCases(unittest.TestCase):
   # we don't need more of these. it's unclear if torch's behavior is desired here
@@ -91,7 +91,6 @@ class TestEmptyTensorEdgeCases(unittest.TestCase):
     with self.assertRaises(RuntimeError):
       Tensor([]).argmax()
 
-  @unittest.expectedFailure
   def test_masked_select_empty(self):
     # Masked select on empty tensors should return an empty tensor.
     torch_out = torch.tensor([], dtype=torch.float32).masked_select(torch.tensor([], dtype=torch.bool))
