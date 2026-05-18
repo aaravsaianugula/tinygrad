@@ -1,9 +1,9 @@
 # tinygrad allows you to write kernels at many different abstractions levels.
 # This is for RDNA3, but if you don't have one you can run with the emulator
-# PYTHONPATH="." MOCKGPU=1 DEV=AMD
+# PYTHONPATH="." DEV=MOCKPCI+AMD
 
 from tinygrad import Tensor, Context, GlobalCounters, UOp, Device
-from tinygrad.helpers import DEBUG, getenv
+from tinygrad.helpers import DEV, DEBUG, getenv
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.runtime.autogen.amd.rdna3.ins import *
@@ -16,7 +16,7 @@ def eval_harness(name, tensor, fxn, check=None):
   print(f"computed in {GlobalCounters.time_sum_s*1000:.2f} ms, {(a.nbytes()/1e9)/GlobalCounters.time_sum_s:.2f} GB/s")
   return out
 
-SZ = 256*1024 if getenv("MOCKGPU") else 1024*1024*1024
+SZ = 256*1024 if DEV.interface.startswith("MOCK") else 1024*1024*1024
 
 def example_2_hip(a:Tensor, correct):
   GLOBALS = 1024
@@ -105,7 +105,7 @@ def example_3_custom_uop(a:Tensor, correct):
 def example_5_custom_assembly(a:Tensor, correct):
   # Kernel class copied from amd_asm_matmul
   class Kernel:
-    def __init__(self, arch='gfx1100'): self.instructions, self.labels, self.pos, self.arch = [], {}, 0, arch
+    def __init__(self): self.instructions, self.labels, self.pos = [], {}, 0
     def label(self, name): self.labels[name] = self.pos
     def emit(self, inst, target=None):
       self.instructions.append(inst)

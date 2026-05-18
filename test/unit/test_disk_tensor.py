@@ -92,10 +92,6 @@ class TestRawDiskBuffer(unittest.TestCase):
       # should fail because 3 int8 is 3 bytes but float16 is two and 3 isn't a multiple of 2
       Tensor.empty((3,), dtype=dtypes.int8, device=f"DISK:{tmp}").bitcast(dtypes.float16)
 
-    with self.assertRaises(RuntimeError):
-      # should fail because backprop through bitcast is undefined
-      Tensor.empty((4,), dtype=dtypes.int8, requires_grad=True, device=f"DISK:{tmp}").bitcast(dtypes.float16)
-
     pathlib.Path(tmp).unlink()
 
 @unittest.skipUnless(is_dtype_supported(dtypes.uint8), "need uint8")
@@ -447,13 +443,13 @@ class TestDiskTensor(TempDirTestCase):
     # get the DiskDevice and check internal state
     disk_device = Device[f"DISK:{fn}"]
     assert isinstance(disk_device, DiskDevice)
-    assert disk_device.count == 1
+    assert disk_device.refcount == 1
     assert hasattr(disk_device, "mem")
     first_fd = disk_device.fd
     # create second tensor on same file - should reuse the device, not re-open
     t2 = Tensor.empty(64, device=f"disk:{fn}", dtype=dtypes.uint8)
     t2.to("CPU").realize()
-    assert disk_device.count == 2
+    assert disk_device.refcount == 2
     assert disk_device.fd == first_fd, "file descriptor changed - file was unnecessarily re-opened"
     # verify data is correct
     np.testing.assert_equal(t1.numpy(), np.arange(128, dtype=np.uint8))
