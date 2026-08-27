@@ -29,8 +29,12 @@ class AMDIP:
 # this is not universally correct, see below for an example, but appears reliable for most recent gpus
 # https://github.com/torvalds/linux/blob/9207d47f966be9f4d52e7e0119ac2b7a7e366f3e/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c#L3163
 def import_module(name:str, target:tuple[int, int, int], submod=""):
-  # version overrides
-  target = {("smu", (13, 0, 7)): (13, 0, 0)}.get((name, target), target)
+  # version overrides. nbio on RDNA2 is the awkward one: discovery reports 3.3.x but AMD's header
+  # is nbio_2_3, so not even the major matches and the "same major, <= target" rule below could
+  # never find it. Navi 21/22/23/24 all report 3.3.0-3.3.2.
+  target = {("smu", (13, 0, 7)): (13, 0, 0),
+            ("nbio", (3, 3, 0)): (2, 3, 0), ("nbio", (3, 3, 1)): (2, 3, 0),
+            ("nbio", (3, 3, 2)): (2, 3, 0)}.get((name, target), target)
   mod = getattr(tinygrad.runtime.autogen.am, submod) if submod else tinygrad.runtime.autogen.am
   if (children:=[c for c in mod.__all__ if c.startswith(name) and (v:=tuple(map(int, c.split('_')[1:])))[0] == target[0] and v <= target]):
     return getattr(mod, children[-1])

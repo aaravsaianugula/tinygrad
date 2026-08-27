@@ -1,8 +1,8 @@
 import pathlib, hashlib, re, itertools
 from tinygrad.runtime.autogen import load, root
 
-__all__ = ["am", "pm4_soc15", "pm4_nv", "sdma_4_0_0", "sdma_5_0_0", "sdma_6_0_0", "smu_13_0_0", "smu_13_0_6", "smu_13_0_12", "smu_14_0_2",
-           "fw", "navi_offsets", "vega_offsets", "regs", "soc_9", "soc_11", "soc_12", "pmc"]
+__all__ = ["am", "pm4_soc15", "pm4_nv", "sdma_4_0_0", "sdma_5_0_0", "sdma_6_0_0", "smu_11_0_7", "smu_13_0_0", "smu_13_0_6", "smu_13_0_12",
+           "smu_14_0_2", "fw", "navi_offsets", "vega_offsets", "regs", "soc_9", "soc_10", "soc_11", "soc_12", "pmc"]
 
 am_src="https://github.com/ROCm/ROCK-Kernel-Driver/archive/33970e1351f5e511029602454979f3de7e22260f.tar.gz"
 rocm_src="https://github.com/ROCm/rocm-systems/archive/cccc350dc620e61ae2554978b62ab3532dc10bd9.tar.gz"
@@ -11,22 +11,39 @@ inc, kern_rules = ["-include", "stdint.h"], [(r'le32_to_cpu', ''),]
 fw_src="https://gitlab.com/kernel-firmware/linux-firmware/-/archive/1e2c15348485939baf1b6d1f5a7a3b799d80703d/1e2c15348485939baf1b6d1f5a7a3b799d80703d.tar.gz"
 pmc_src="https://raw.githubusercontent.com/ROCm/rocm-systems/cccc350dc620e61ae2554978b62ab3532dc10bd9/projects/rocprofiler-compute/src/rocprof_compute_soc/profile_configs/counter_defs.yaml"
 
+# RDNA2 (gfx10.3) adds gc 10.3.0, hdp 5.0.0, mmhub 2.0.0, osssys 5.0.0, nbio 2.3.0. AMD ships one
+# header set per family rather than per part, and import_module takes the greatest match with the
+# same major that is <= the target, so Navi 21-24 all resolve through these:
+#   gc 10.3.x -> gc_10_3_0      hdp 5.0.x -> hdp_5_0_0      osssys 5.0.x -> osssys_5_0_0
+#   mmhub 2.1.x -> mmhub_2_0_0  (there is no mmhub_2_1_0; the kernel drives 2.1.x with mmhub_v2_0)
+# nbio is the exception and also needs the override in runtime/support/amd.py: discovery reports
+# 3.3.x but the header is nbio_2_3, so neither the major nor the file name lines up.
 reg_files = {
-  "gc": [(9,4,3), (11,0,0), (11,0,3), (11,5,0), (12,0,0)],
-  "mmhub": [(1,8,0), (3,0,0), (3,0,1), (3,0,2), (3,3,0), (4,1,0)],
-  "nbio": [(4,3,0), (7,2,0), (7,7,0), (7,9,0), (7,11,0)], "nbif": [(6,3,1)],
-  "mp": [(11,0,0), (13,0,0), (14,0,2)], "hdp": [(4,4,2), (6,0,0), (7,0,0)],
-  "osssys": [(4,4,2), (6,0,0), (6,1,0), (7,0,0)], "sdma": [(4,4,2)]
+  "gc": [(9,4,3), (10,3,0), (11,0,0), (11,0,3), (11,5,0), (12,0,0)],
+  "mmhub": [(1,8,0), (2,0,0), (3,0,0), (3,0,1), (3,0,2), (3,3,0), (4,1,0)],
+  "nbio": [(2,3,0), (4,3,0), (7,2,0), (7,7,0), (7,9,0), (7,11,0)], "nbif": [(6,3,1)],
+  "mp": [(11,0,0), (13,0,0), (14,0,2)], "hdp": [(4,4,2), (5,0,0), (6,0,0), (7,0,0)],
+  "osssys": [(4,4,2), (5,0,0), (6,0,0), (6,1,0), (7,0,0)], "sdma": [(4,4,2)]
 }
+
+# A few headers are not named after the IP version reg_files keys them by. Applied to the source
+# path only, so the generated table still lands under its IP-version name in __all__.
+header_renames = {"mp_11_0_0": "mp_11_0", "nbio_2_3_0": "nbio_2_3"}
 
 reg_patterns = {
   "gc": ["GCVM", "GCMC_VM", "CP_(HQD|MQD|MEC|ME_CNTL|PERFMON|RB_WPTR_POLL_CNTL|INT_CNTL|STAT|PFP_PRGRM|ME_PRGRM|COHER_START)", "COMPUTE_",
          "(SQ|GL2C|TCC)_PERFCOUNTER", "SQ_THREAD_TRACE", "SPI_(CONFIG_CNTL|COMPUTE_QUEUE_RESET)", "GRBM", "SH_MEM", "RLC", "TCP", "GB_ADDR_CONFIG",
          "SDMA[01]_(WATCHDOG_CNTL|UTCL1_(CNTL|PAGE)|MCU_CNTL|F32_CNTL|CNTL|QUEUE0_|RLC_CGCG_CTRL)", "SCRATCH_REG[67]"],
   "mmhub": ["MMVM", "MMMC_VM", "MM_ATC_L2_MISC_CG"],
+  # The last four entries are RDNA2's spellings of registers the earlier ones name for gfx11+.
+  # nbio_2_3 predates the BIF_BX0_/BIF_BX_PF0_ prefixes and the reg* rename, so the same
+  # hardware appears as mmPCIE_INDEX2, mmBIF_DOORBELL_INT_CNTL, mmREMAP_HDP_MEM_FLUSH_CNTL and
+  # mmBIF_BX_PF_GPU_HDP_FLUSH_REQ. Matching is anchored, so these cannot pull in the gfx11
+  # names (or the 30-odd SR-IOV VF copies) -- they only fire on the older header.
   "nbio": (nbio:=["BIF_BX_PF[01]_GPU_HDP_FLUSH", "BIF_BX_PF0_RSMU", "BIF_BX0_(REMAP_HDP_MEM_FLUSH_CNTL|BIF_DOORBELL_INT_CNTL|PCIE_INDEX2|PCIE_DATA2)",
                   "BIFC_(DOORBELL_ACCESS_EN_PF|GFX_INT_MONITOR_MASK)", "XCC_DOORBELL_FENCE", "DOORBELL0_CTRL_ENTRY", "GDC_S2A0_S2A_DOORBELL_ENTRY",
-                  "S2A_DOORBELL_ENTRY", "RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN", "RCC_DEV0_EPF2_STRAP2"]),
+                  "S2A_DOORBELL_ENTRY", "RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN", "RCC_DEV0_EPF2_STRAP2",
+                  "PCIE_(INDEX2|DATA2)", "BIF_DOORBELL_INT_CNTL", "REMAP_HDP_MEM_FLUSH_CNTL", "BIF_BX_PF_GPU_HDP_FLUSH"]),
   "nbif": nbio,
   "mp": ["MP([01]|ASP)_SMN_C2PMSG"], "hdp": ["HDP_MEM_POWER_CTRL"], "oss": ["IH_"], "sdma": ["SDMA_GFX", "SDMA_CNTL"]
 }
@@ -47,6 +64,11 @@ def __getattr__(nm):
                                    args=["-I/opt/rocm/include", "-x", "c++"], srcs=am_src)
     case "sdma_6_0_0": return load("am/sdma_6_0_0", [root/"extra/hip_gpu_driver/sdma_registers.h", f"{AMD}/amdgpu/sdma_v6_0_0_pkt_open.h"],
                                    args=["-I/opt/rocm/include", "-x", "c++"], srcs=am_src)
+    # RDNA2. Navi 21-24 report MP1 11.0.7/11/12/13; AMD ships one PPSMC header for the whole
+    # Sienna Cichlid family, and 11.0.7 is the lowest of them, so import_module's "greatest match
+    # <= target with the same major" lands every Navi 2x on this module with no override needed.
+    case "smu_11_0_7": return load("am/smu_11_0_7", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v11_0_7_ppsmc",
+      "smu11_driver_if_sienna_cichlid"]] +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
     case "smu_13_0_0": return load("am/smu_13_0_0", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v13_0_0_ppsmc","smu13_driver_if_v13_0_0"]]
                                     +[root/"extra/amdpci/headers/amdgpu_smu.h"], args=inc, srcs=am_src)
     case "smu_13_0_6": return load("am/smu_13_0_6", [f"{AMD}/pm/swsmu/inc/pmfw_if/{s}.h" for s in ["smu_v13_0_6_ppsmc","smu_v13_0_6_pmfw", \
@@ -66,7 +88,10 @@ def __getattr__(nm):
     case "regs":
       def genreg(_, files, **kwargs):
         out = ["__all__ = " + repr([file.split('/')[-1] for file in files])]
-        for file, nm in [(file.replace("mp_11_0_0", "mp_11_0"), file.split('/')[-1]) for file in files]:
+        def rename(f):
+          for a, b in header_renames.items(): f = f.replace(a, b)
+          return f
+        for file, nm in [(rename(file), file.split('/')[-1]) for file in files]:
           pats = reg_patterns[prefix := {"osssys": "oss"}.get(x:=nm.split("_", 1)[0], x)]
 
           def split_name(name): return name[:(pos:=next((i for i,c in enumerate(name) if c.isupper()), len(name)))], name[pos:]
@@ -86,9 +111,10 @@ def __getattr__(nm):
         return "\n".join(out)
       return load("am/regs", [AMDINC + "/asic_reg/" + {"osssys":"oss"}.get(pre, pre) + f"/{pre}_{'_'.join(map(str, ver))}"
                               for pre in reg_files for ver in sorted(reg_files[pre])], srcs=am_src, gen=genreg)
-    case "soc_9" | "soc_11" | "soc_12":
-      return load(f"am/{nm}", ["{}/projects/aqlprofile/linux/" + {9: "vega10", 11: "soc21", 12: "soc24"}[int(nm.split('_')[1])] + "_enum.h"],
-                  srcs=rocm_src, patterns=soc_patterns, macros=False)
+    case "soc_9" | "soc_10" | "soc_11" | "soc_12":
+      # gfx10 (RDNA1/RDNA2) predates the soc21 naming; its enum header is still called navi10.
+      return load(f"am/{nm}", ["{}/projects/aqlprofile/linux/" + {9: "vega10", 10: "navi10", 11: "soc21", 12: "soc24"}[int(nm.split('_')[1])]
+                  + "_enum.h"], srcs=rocm_src, patterns=soc_patterns, macros=False)
     case "pmc":
       def genpmc(_, files, **kwargs):
         from yaml import safe_load # type: ignore
