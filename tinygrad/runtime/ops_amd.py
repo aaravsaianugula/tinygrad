@@ -25,6 +25,25 @@ SQTT = ContextVar("SQTT", abs(VIZ.value)>=2)
 SQTT_ITRACE_SE_MASK, SQTT_LIMIT_SE, SQTT_SIMD_SEL, SQTT_TOKEN_EXCLUDE = \
   ContextVar("SQTT_ITRACE_SE_MASK", 0b11), ContextVar("SQTT_LIMIT_SE", 0), ContextVar("SQTT_SIMD_SEL", 0), ContextVar("SQTT_TOKEN_EXCLUDE", 0)
 PMC = ContextVar("PMC", abs(VIZ.value)>=2)
+# GC IP version -> KFD gfx_target_version. Packing the three IP digits works for gfx9/11/12 but is
+# simply wrong on gfx10, where AMD's gfx numbering and the discovery IP version diverge -- five of
+# the seven GC 10.3.x versions land on a different target than digit-packing gives, and the
+# mapping is not even monotonic (10.3.2 -> gfx1031 while 10.3.4 -> gfx1032). Getting this wrong is
+# silent: you get a plausible target for a different ASIC. Transcribed from the kernel's own table,
+# drivers/gpu/drm/amd/amdkfd/kfd_device.c, at the ROCK commit autogen/am pins.
+GFX_TARGET_VERSION = {
+  (9,4,3): 90402,                                                                       # MI300
+  (10,1,10): 100100, (10,1,2): 100101, (10,1,1): 100102, (10,1,3): 100103,              # Navi 10/12/14
+  (10,1,4): 100103,                                                                     # Cyan Skillfish
+  (10,3,0): 100300,  # Sienna Cichlid   gfx1030
+  (10,3,2): 100301,  # Navy Flounder    gfx1031
+  (10,3,4): 100302,  # Dimgrey Cavefish gfx1032
+  (10,3,1): 100303,  # Van Gogh         gfx1033
+  (10,3,5): 100304,  # Beige Goby       gfx1034
+  (10,3,3): 100305,  # Yellow Carp      gfx1035
+  (10,3,6): 100306, (10,3,7): 100306,  #                gfx1036
+}
+
 EVENT_INDEX_PARTIAL_FLUSH = 4 # based on a comment in nvd.h
 WAIT_REG_MEM_FUNCTION_EQ  = 3 # ==
 WAIT_REG_MEM_FUNCTION_NEQ = 4 # !=
@@ -855,7 +874,8 @@ class PCIIface(PCIIfaceBase):
   def _compute_props(self):
     self.ip_versions = self.dev_impl.ip_ver
 
-    gfxver = int(f"{self.dev_impl.ip_ver[am.GC_HWIP][0]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][1]:02d}{self.dev_impl.ip_ver[am.GC_HWIP][2]:02d}")
+    gc = tuple(self.dev_impl.ip_ver[am.GC_HWIP])
+    gfxver = GFX_TARGET_VERSION.get(gc, int(f"{gc[0]:02d}{gc[1]:02d}{gc[2]:02d}"))
     if self.dev_impl.gc_info.header.version_major == 2:
       cu_per_sa = self.dev_impl.gc_info.gc_num_cu_per_sh
       max_sh_per_se = self.dev_impl.gc_info.gc_num_sh_per_se
@@ -867,7 +887,7 @@ class PCIIface(PCIIfaceBase):
     self.props = {'cu_per_simd_array': cu_per_sa, 'simd_count': 2 * cu_per_sa * array_count, 'simd_per_cu': 2, 'array_count': array_count,
       'max_slots_scratch_cu': self.dev_impl.gc_info.gc_max_scratch_slots_per_cu, 'max_waves_per_simd': self.dev_impl.gc_info.gc_max_waves_per_simd,
       'simd_arrays_per_engine': max_sh_per_se, 'lds_size_in_kb': self.dev_impl.gc_info.gc_lds_size, 'num_xcc': self.dev_impl.gfx.xccs,
-      'gfx_target_version': {90403: 90402}.get(gfxver, gfxver)}
+      'gfx_target_version': gfxver}
 
   def create_queue(self, queue_type, ring, gart, rptr, wptr, eop_buffer=None, cwsr_buffer=None, ctl_stack_size=0, ctx_save_restore_size=0,
                    xcc_id=0, idx=0):
@@ -950,7 +970,10 @@ class AMDDevice(HCQCompiled):
 
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
-    assert (self.target in ((9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
+    # gfx10.3 (RDNA2) admitted once the driver actually brought one up: PSP, SOC, GMC, IH, SMU,
+    # GFX and SDMA all initialize on a Navi 23 over a USB4 dock. gfx10.1 is deliberately not
+    # here -- nothing has run one.
+    assert (self.target in ((9,4,2),(9,5,0))) or self.target[:2] == (10,3) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 
     self.xccs = self.iface.props.get('num_xcc', 1)
@@ -1067,7 +1090,11 @@ class AMDDevice(HCQCompiled):
       wave_scratch = ceildiv(lanes_per_wave * size_per_thread, mem_alignment_size)
       num_waves = (size_per_xcc // (wave_scratch * mem_alignment_size)) // (self.se_cnt if self.target[0] != 9 else 1)
 
-      tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
+      # gfx10 splits COMPUTE_TMPRING_SIZE the same way gfx9 does -- WAVES 0:11, WAVESIZE 12:24 --
+      # so it shares the unsuffixed union. gfx11 widened WAVESIZE to 12:26 and gfx12 to 12:29,
+      # which is why those have their own; ROCR ships no GFX10 variant because there is nothing
+      # to vary. Reading the suffix off the major alone asked for a union that does not exist.
+      tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"" if self.target[0] in (9, 10) else "_GFX"+str(self.target[0])}_bitfields')
       self.tmpring_size = int.from_bytes(tmpring_t(WAVES=min(num_waves, max_scratch_waves), WAVESIZE=wave_scratch), 'little')
       self.max_private_segment_size = private_segment_size
 

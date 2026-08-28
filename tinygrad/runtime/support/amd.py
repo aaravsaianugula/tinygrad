@@ -29,8 +29,12 @@ class AMDIP:
 # this is not universally correct, see below for an example, but appears reliable for most recent gpus
 # https://github.com/torvalds/linux/blob/9207d47f966be9f4d52e7e0119ac2b7a7e366f3e/drivers/gpu/drm/amd/amdgpu/amdgpu_discovery.c#L3163
 def import_module(name:str, target:tuple[int, int, int], submod=""):
-  # version overrides
-  target = {("smu", (13, 0, 7)): (13, 0, 0)}.get((name, target), target)
+  # version overrides. nbio on RDNA2 is the awkward one: discovery reports 3.3.x but AMD's header
+  # is nbio_2_3, so not even the major matches and the "same major, <= target" rule below could
+  # never find it. Navi 21/22/23/24 all report 3.3.0-3.3.2.
+  target = {("smu", (13, 0, 7)): (13, 0, 0),
+            ("nbio", (3, 3, 0)): (2, 3, 0), ("nbio", (3, 3, 1)): (2, 3, 0),
+            ("nbio", (3, 3, 2)): (2, 3, 0)}.get((name, target), target)
   mod = getattr(tinygrad.runtime.autogen.am, submod) if submod else tinygrad.runtime.autogen.am
   if (children:=[c for c in mod.__all__ if c.startswith(name) and (v:=tuple(map(int, c.split('_')[1:])))[0] == target[0] and v <= target]):
     return getattr(mod, children[-1])
@@ -43,5 +47,28 @@ def import_pmc(ip) -> dict[str, tuple[str, int]]:
   # NOTE: precise arch for mi300+, generic for others, since rocm headers lack some archs
   return {k:x for k,v in pmc.counters.items() if (x:=v.get(f"gfx{ip[0]}{ip[1]:x}{ip[2]:x}" if ip[0] == 9 else f"gfx{ip[0]}", None)) is not None}
 
+# gfx10-era AMD headers spell every register mm*; gfx11 and later spell them reg*, and AM is
+# written entirely in reg*. AMDev.reg() is a bare __dict__ lookup, so without an alias not one
+# register on a Navi 2x card resolves. A few registers moved rather than being re-spelled --
+# nbio_2_3 predates the BIF_BX0_/BIF_BX_PF0_ prefixes -- and those need naming outright.
+legacy_reg_renames = {"regBIF_BX0_PCIE_INDEX2": "mmPCIE_INDEX2", "regBIF_BX0_PCIE_DATA2": "mmPCIE_DATA2",
+                      "regBIF_BX0_BIF_DOORBELL_INT_CNTL": "mmBIF_DOORBELL_INT_CNTL",
+                      "regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL": "mmREMAP_HDP_MEM_FLUSH_CNTL",
+                      "regBIF_BX_PF0_GPU_HDP_FLUSH_REQ": "mmBIF_BX_PF_GPU_HDP_FLUSH_REQ",
+                      "regBIF_BX_PF0_GPU_HDP_FLUSH_DONE": "mmBIF_BX_PF_GPU_HDP_FLUSH_DONE"}
+
+def alias_legacy_regs(regs:dict) -> dict:
+  # Registers that do not exist on the older silicon are deliberately left absent rather than
+  # aliased to something near them, so a code path that is wrong for this generation raises
+  # instead of quietly reading an unrelated offset.
+  if not any(name.startswith("mm") for name in regs): return regs
+  aliased = dict(regs)
+  for name, val in regs.items():
+    if name.startswith("mm"): aliased.setdefault("reg"+name[2:], val)
+  for new, old in legacy_reg_renames.items():
+    if old in regs: aliased.setdefault(new, regs[old])
+  return aliased
+
 def import_asic_regs(prefix:str, version:tuple[int, int, int], cls=AMDReg) -> dict[str, AMDReg]:
-  return {reg:cls(name=reg, offset=off, segment=seg, fields=fields) for reg,(off,seg,fields) in import_module(prefix, version, submod="regs").items()}
+  regs = alias_legacy_regs(import_module(prefix, version, submod="regs"))
+  return {reg:cls(name=reg, offset=off, segment=seg, fields=fields) for reg,(off,seg,fields) in regs.items()}

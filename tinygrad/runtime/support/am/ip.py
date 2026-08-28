@@ -34,18 +34,36 @@ class AM_SOC(AM_IP):
         self.adev.indirect_wreg_pcie(self.adev.regXCC_DOORBELL_FENCE.addr[0], self.adev.regXCC_DOORBELL_FENCE.encode(shub_slv_mode=1), aid=aid)
       self.adev.regBIFC_GFX_INT_MONITOR_MASK.write(0x7ff)
       self.adev.regBIFC_DOORBELL_ACCESS_EN_PF.write(0xfffff)
-    else: self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
+    # nbio 2.3 has no such register and nbio_v2_3.c never writes one: this is an errata write
+    # that arrives with nbio 4.3 (nbio_v4_3.c:337) and nbif 6.3 (nbif_v6_3_1.c:295). MI300's
+    # nbio 7.9 takes the branch above.
+    elif self.adev.ip_ver[am.NBIO_HWIP] >= (4,0,0): self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
     self.adev.regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN.write(0x1)
   def set_clockgating_state(self):
     if self.adev.ip_ver[am.HDP_HWIP] >= (5,2,1): self.adev.regHDP_MEM_POWER_CTRL.update(atomic_mem_power_ctrl_en=1, atomic_mem_power_ds_en=1)
 
   def doorbell_enable(self, port, awid=0, awaddr_31_28_value=0, offset=0, size=0, aid=0):
+    # The S2A doorbell router arrives with nbio 4.3. nbio 2.3 has no router and no port to
+    # address -- it ranges doorbells per client instead, which is doorbell_range() below. The
+    # two are complementary: each generation gets exactly one of them, and each no-ops on the
+    # other's hardware rather than pretending to be portable.
+    if self.adev.ip_ver[am.NBIO_HWIP] < (4,0,0): return
     reg = self.adev.reg(f"{'regGDC_S2A0_S2A' if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else 'regS2A'}_DOORBELL_ENTRY_{port}_CTRL")
     val = reg.encode(**{f"s2a_doorbell_port{port}_enable":1, f"s2a_doorbell_port{port}_awid":awid,  f"s2a_doorbell_port{port}_range_size":size,
       f"s2a_doorbell_port{port}_awaddr_31_28_value":awaddr_31_28_value, f"s2a_doorbell_port{port}_range_offset":offset})
 
     if self.adev.ip_ver[am.NBIO_HWIP] in {(7,9,0), (7,9,1)}: self.adev.indirect_wreg_pcie(reg.addr[0], val, aid=aid)
     else: reg.write(val)
+
+  def doorbell_range(self, client:str, offset:int, size:int):
+    """Give one client its window in the doorbell aperture, on nbio that ranges per client.
+
+    nbio_v2_3.c:109 programs BIF_<client>_DOORBELL_RANGE with the ring's doorbell index and the
+    window size. A no-op where the S2A router already did this by port. IH needs no entry here:
+    AM disables the IH doorbell outright (regIH_DOORBELL_RPTR.enable=0).
+    """
+    if self.adev.ip_ver[am.NBIO_HWIP] < (4,0,0):
+      self.adev.reg(f"regBIF_{client}_DOORBELL_RANGE").update(offset=offset, size=size)
 
 class AM_GMC(AM_IP):
   def init_sw(self):
@@ -171,6 +189,9 @@ class AM_GMC(AM_IP):
     if self.adev.ip_ver[am.GC_HWIP] < (10,0,0): return (pte & am.AMDGPU_PDE_PTE) if pte_lv != am.AMDGPU_VM_PDB0 else not (pte & am.AMDGPU_PTE_TF)
     return pte & (am.AMDGPU_PDE_PTE_GFX12 if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else am.AMDGPU_PDE_PTE)
 
+class SMUError(RuntimeError):
+  """The SMU answered, and said no. Distinct from a timeout, where it did not answer at all."""
+
 class AM_SMU(AM_IP):
   def init_sw(self):
     self.smu_mod = self.adev._ip_module("smu", am.MP1_HWIP)
@@ -182,7 +203,7 @@ class AM_SMU(AM_IP):
     self._send_msg(self.smu_mod.PPSMC_MSG_EnableAllSmuFeatures, 0)
 
   def is_smu_alive(self):
-    with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_GetSmuVersion, 0, timeout=100)
+    with contextlib.suppress(TimeoutError, SMUError): self._send_msg(self.smu_mod.PPSMC_MSG_GetSmuVersion, 0, timeout=100)
     return self.adev.mmMP1_SMN_C2PMSG_90.read() != 0
 
   def mode1_reset(self):
@@ -210,12 +231,13 @@ class AM_SMU(AM_IP):
 
     if level is None:
       for clck in clks:
-        with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16, timeout=20)
+        with contextlib.suppress(TimeoutError, SMUError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16, timeout=20)
         if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | 0xffff)
       return
 
     for clck, vals in self.read_clocks(clks).items():
-      with contextlib.suppress(TimeoutError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | (vals[level]), timeout=20)
+      with contextlib.suppress(TimeoutError, SMUError):
+        self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | (vals[level]), timeout=20)
       if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | (vals[level]))
 
   def set_power_limit(self, watts:float):
@@ -238,10 +260,17 @@ class AM_SMU(AM_IP):
     (self.adev.mmMP1_SMN_C2PMSG_82 if not debug else self.adev.mmMP1_SMN_C2PMSG_53).write(param)
     (self.adev.mmMP1_SMN_C2PMSG_66 if not debug else self.adev.mmMP1_SMN_C2PMSG_75).write(msg)
 
+  # smu_cmn.c's response codes. The SMU sets one of these promptly, so treating anything that is
+  # not SMU_RESP_OK as "keep waiting" burns the whole timeout and then blames the wrong thing:
+  # a message the SMU refused in microseconds is reported as a ten-second hang.
+  smu_resp = {0xFF: "CMD_FAIL", 0xFE: "CMD_UNKNOWN", 0xFD: "CMD_BAD_PREREQ", 0xFC: "BUSY_OTHER", 0xFB: "DEBUG_END"}
+
   def _send_msg(self, msg:int, param:int, read_back_arg=False, timeout=10000, debug=False): # default timeout is 10 seconds
     self._smu_cmn_send_msg(msg, param, debug=debug)
-    wait_cond((self.adev.mmMP1_SMN_C2PMSG_90 if not debug else self.adev.mmMP1_SMN_C2PMSG_54).read, value=1, timeout_ms=timeout,
-      msg=f"SMU msg {msg:#x} timeout")
+    resp_reg = self.adev.mmMP1_SMN_C2PMSG_90 if not debug else self.adev.mmMP1_SMN_C2PMSG_54
+    wait_cond(lambda: resp_reg.read() in {1, *self.smu_resp}, value=True, timeout_ms=timeout, msg=f"SMU msg {msg:#x} timeout")
+    if (resp:=resp_reg.read()) != 1:
+      raise SMUError(f"SMU refused msg {msg:#x} (param {param:#x}): {self.smu_resp[resp]} [{resp:#x}]")
     return (self.adev.mmMP1_SMN_C2PMSG_82 if not debug else self.adev.mmMP1_SMN_C2PMSG_53).read() if read_back_arg else None
 
 class AM_GFX(AM_IP):
@@ -261,7 +290,11 @@ class AM_GFX(AM_IP):
     self._config_mec()
 
     # NOTE: Golden reg for gfx11. No values for this reg provided. The kernel just ors 0x20000000 to this reg.
-    for xcc in range(self.xccs): self.adev.regTCP_CNTL.write(self.adev.regTCP_CNTL.read() | 0x20000000, inst=xcc)
+    # Not gfx10: there 0x20000000 is DB_DEBUG's golden value, and mmTCP_CNTL's is 0x479c0010
+    # (gfx_v10_0.c:492). Applying the gfx11 or-mask here would write the wrong value, so gfx10.3
+    # skips it -- its golden registers are their own job.
+    if self.adev.ip_ver[am.GC_HWIP][0] != 10:
+      for xcc in range(self.xccs): self.adev.regTCP_CNTL.write(self.adev.regTCP_CNTL.read() | 0x20000000, inst=xcc)
 
     for xcc in range(self.xccs): self.adev.regRLC_CNTL.write(0x1, inst=xcc)
 
@@ -358,7 +391,9 @@ class AM_GFX(AM_IP):
 
       self.adev.regCP_RB_WPTR_POLL_CNTL.update(poll_frequency=0x100, idle_poll_count=0x90, inst=xcc)
       self.adev.regCP_INT_CNTL.update(cntx_busy_int_enable=1, cntx_empty_int_enable=1, cmp_busy_int_enable=1, inst=xcc)
-      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+      # These arrive with gfx11 -- they are absent from the gfx10.3 and gfx9.4 register sets, and
+      # sdma_v5_2.c writes no SDMA CGCG register at all for Navi 2x.
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
         self.adev.regSDMA0_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
         self.adev.regSDMA1_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
 
@@ -374,7 +409,9 @@ class AM_GFX(AM_IP):
 
   def _enable_mec(self):
     for xcc in range(self.xccs):
-      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self.adev.regCP_MEC_RS64_CNTL.update(mec_pipe0_reset=0, mec_pipe0_active=1, mec_halt=0, inst=xcc)
+      # RS64 microengines arrive with gfx11. gfx9 and gfx10 are both F32 and start the same
+      # way: write CP_MEC_CNTL back to zero (gfx_v10_0.c:6460, gfx_v9_0 does the same).
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self.adev.regCP_MEC_RS64_CNTL.update(mec_pipe0_reset=0, mec_pipe0_active=1, mec_halt=0, inst=xcc)
       else: self.adev.regCP_MEC_CNTL.write(0x0, inst=xcc)
     time.sleep(0.05)  # Wait for MEC to be ready
 
@@ -390,10 +427,16 @@ class AM_GFX(AM_IP):
     for xcc in range(self.adev.gfx.xccs):
       if self.adev.ip_ver[am.GC_HWIP] < (10,0,0):
         self.adev.regCP_MEC_CNTL.update(mec_invalidate_icache=1, mec_me1_pipe0_reset=1, mec_me2_pipe0_reset=1, mec_me1_halt=1,mec_me2_halt=1,inst=xcc)
+      elif self.adev.ip_ver[am.GC_HWIP] < (11,0,0):
+        # gfx10.3's MEC is F32 with no program counter to point anywhere, so there is no
+        # ucode_start for it and the RS64 helper below has nothing to write. The whole sequence
+        # is halt here, zero in _enable_mec (gfx_v10_0.c:6460-6484) -- no icache invalidate and
+        # no pipe reset, which belong to gfx9's direct-load path and not to the PSP path.
+        self.adev.regCP_MEC_CNTL.update(mec_me1_halt=1, mec_me2_halt=1, inst=xcc)
       if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0):
         _config_helper(eng_name="PFP", cntl_reg="ME", eng_reg="PFP", pipe_cnt=1, xcc=xcc)
         _config_helper(eng_name="ME", cntl_reg="ME", eng_reg="ME", pipe_cnt=1, xcc=xcc)
-      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
         _config_helper(eng_name="MEC", cntl_reg="MEC_RS64", eng_reg="MEC_RS64", pipe_cnt=1, me=1, xcc=xcc)
 
   def _dequeue_hqds(self):
@@ -430,7 +473,8 @@ class AM_IH(AM_IP):
     if self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
       self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
       self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
-      self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
+      # OSSSYS 5 has no MSI storm register, and navi10_ih.c programs no storm block on Navi 2x.
+      if self.adev.ip_ver[am.OSSSYS_HWIP] >= (6,0,0): self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
 
     # toggle interrupts
     for _, rwptr_vm, suf, ring_id in self.rings:
@@ -520,7 +564,14 @@ class AM_SDMA(AM_IP):
           self.adev.reg(f"regDOORBELL0_CTRL_ENTRY_{entry}").write(**{f"bif_doorbell{entry}_range_size_entry": 20,
             f"bif_doorbell{entry}_range_offset_entry": (am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (entry - 1) * 0xA) * 2})
           self.adev.soc.doorbell_enable(port=port, awid=awid, awaddr_31_28_value=awaddr, offset=offset, size=4, aid=aid_id)
-    else: self.adev.soc.doorbell_enable(port=2, awid=0xe, awaddr_31_28_value=0x3, offset=am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0*2, size=4)
+    else:
+      self.adev.soc.doorbell_enable(port=2, awid=0xe, awaddr_31_28_value=0x3, offset=am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0*2, size=4)
+      # Same routing expressed the way nbio 2.3 expresses it, one register per engine. The
+      # window is 20 doorbells wide, matching adev->doorbell_index.sdma_doorbell_range, and the
+      # offset is the ring's own doorbell index in dwords -- the value setup_ring() writes to
+      # SDMA{i}_GFX_DOORBELL_OFFSET.
+      for inst in range(2):
+        self.adev.soc.doorbell_range(f"SDMA{inst}", (am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + inst * 0xA) * 2, 20)
 
   def fini_hw(self):
     for reg, inst in self.sdma_reginst:
@@ -538,7 +589,12 @@ class AM_SDMA(AM_IP):
     if self.adev.ip_ver[am.SDMA0_HWIP] >= (5,0,0) and idx > 0: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available")
 
     pipe, queue = idx // 4, idx % 4
-    reg, inst = ("regSDMA_GFX", pipe+queue*4) if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4) else (f"regSDMA{pipe}_QUEUE{queue}", 0)
+    # Three different spellings of the same ring across three generations: MI300 (4.4) has one
+    # SDMA_GFX block addressed by instance, SDMA 5.x names it SDMA{i}_GFX, and 6.x onward
+    # names it SDMA{i}_QUEUE{q}. gc_10_3_0 carries 45 SDMA0_GFX_* registers and no QUEUE0 at all.
+    if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4): reg, inst = "regSDMA_GFX", pipe+queue*4
+    elif self.adev.ip_ver[am.SDMA0_HWIP] < (6,0,0): reg, inst = f"regSDMA{pipe}_GFX", 0
+    else: reg, inst = f"regSDMA{pipe}_QUEUE{queue}", 0
     doorbell = am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (pipe+queue*4) * 0xA
     self.sdma_reginst.append((reg, inst))
 
@@ -551,10 +607,26 @@ class AM_SDMA(AM_IP):
     self.adev.reg(f"{reg}_DOORBELL_OFFSET").update(offset=doorbell * 2, inst=inst)
     self.adev.reg(f"{reg}_DOORBELL").update(enable=1, inst=inst)
     self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x0, inst=inst)
-    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP][:2]!=(4,4) else {}),
+    # SDMA 6.x folded wptr polling into RB_CNTL. 5.x has no such field -- it enables polling in
+    # its own RB_WPTR_POLL_CNTL, read-modify-write, F32_POLL_ENABLE only (sdma_v5_2.c:573-579).
+    poll_in_rb_cntl = self.adev.ip_ver[am.SDMA0_HWIP] >= (6,0,0)
+    if not poll_in_rb_cntl and self.adev.ip_ver[am.SDMA0_HWIP][:2] != (4,4):
+      self.adev.reg(f"{reg}_RB_WPTR_POLL_CNTL").update(f32_poll_enable=1, inst=inst)
+    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if poll_in_rb_cntl else {}),
       rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=4, rb_enable=1, rb_priv=1, rb_size=(ring_size//4).bit_length()-1, inst=inst)
     self.adev.reg(f"{reg}_IB_CNTL").update(ib_enable=1, inst=inst)
     return doorbell
+
+def psp_autoload_supported(mp0:tuple[int, int, int]) -> bool:
+  """Whether the PSP builds the GFX image itself instead of taking a reg list.
+
+  amdgpu_psp.c:167 turns this on by default and switches it off for a fixed list of MP0
+  versions; this is that list. It decides three things, which is why it is worth naming once:
+  the RLC autoload command, whether the MEC jump table is sent at all, and whether SMU goes
+  through the ordinary firmware list.
+  """
+  return mp0 not in {(9,0,0), (10,0,0), (10,0,1), (11,0,2), (11,0,3), (11,0,4), (11,0,8),
+                     (12,0,1), (13,0,2), (13,0,6), (13,0,14)}
 
 class AM_PSP(AM_IP):
   def init_sw(self):
@@ -580,7 +652,10 @@ class AM_PSP(AM_IP):
     self.tmr_paddr = self.adev.mm.palloc(self.max_tmr_size, align=am.PSP_TMR_ALIGNMENT, zero=False, boot=True) if not self.boot_time_tmr else 0
 
   def init_hw(self):
-    spl_key = am.PSP_FW_TYPE_PSP_SPL if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) else am.PSP_FW_TYPE_PSP_KDB
+    # psp_v13 carries no separate SPL blob and reuses KDB for the SPL slot; psp_v11 and psp_v14
+    # both ship a real one (Navi 23's is 928 bytes), and sending KDB twice leaves the SPL table
+    # unloaded. Only MP0 13.x takes the substitution.
+    spl_key = am.PSP_FW_TYPE_PSP_KDB if self.adev.ip_ver[am.MP0_HWIP][0] == 13 else am.PSP_FW_TYPE_PSP_SPL
     sos_components = [(am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE), (spl_key, am.PSP_BL__LOAD_TOS_SPL_TABLE),
       (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),
       (am.PSP_FW_TYPE_PSP_INTF_DRV, am.PSP_BL__LOAD_INTFDRV), (am.PSP_FW_TYPE_PSP_DBG_DRV, am.PSP_BL__LOAD_DBGDRV),
@@ -599,8 +674,13 @@ class AM_PSP(AM_IP):
 
     for psp_desc in self.adev.fw.descs: self._load_ip_fw_cmd(*psp_desc)
 
-    if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self._rlc_autoload_cmd()
-    else: self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
+    # Autoload is a property of the PSP, not of GC: amdgpu leaves psp->autoload_supported set for
+    # MP0 11.0.12 and psp_load_non_psp_fw() fires GFX_CMD_ID_AUTOLOAD_RLC for it by name
+    # (amdgpu_psp.c:2800). Keying this on GC >= 11 sent Navi 23 down the gfx9 REG_LIST path
+    # instead -- and its RL descriptor is empty, so that path could only ever have raised.
+    if psp_autoload_supported(self.adev.ip_ver[am.MP0_HWIP]): self._rlc_autoload_cmd()
+    elif am.PSP_FW_TYPE_PSP_RL in self.adev.fw.sos_fw:
+      self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
 
   def is_sos_alive(self): return self.adev.reg(f"{self.reg_pref}_81").read() != 0x0
 
