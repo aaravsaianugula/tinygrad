@@ -6,7 +6,7 @@ from tinygrad.runtime.autogen.am import am, fw
 from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.system import PCIDevice
-from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA
+from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA, psp_autoload_supported
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
 
@@ -22,20 +22,53 @@ class AMRegister(AMDReg):
   def update(self, inst=0, **kwargs): self.write(self.read(inst=inst) & ~self.fields_mask(*kwargs.keys()), inst=inst, **kwargs)
 
 class AMFirmware:
+  # linux-firmware ships Navi 2x discrete parts under AMD's codenames, not under the discovery IP
+  # version AM builds names from, so psp_11_0_12_sos.bin and friends simply do not exist there.
+  # This mirrors the kernel's amdgpu_ucode_legacy_naming(), which short-circuits numeric naming
+  # for exactly these parts. The gfx10.3.3/10.3.6/10.3.7 APUs are deliberately absent from the
+  # kernel's table and keep numeric names, so they stay absent here too.
+  legacy_fw_names = {(am.MP0_HWIP, (11,0,12)): "dimgrey_cavefish", (am.MP1_HWIP, (11,0,12)): "dimgrey_cavefish_smc",
+                     (am.SDMA0_HWIP, (5,2,4)): "dimgrey_cavefish_sdma", (am.GC_HWIP, (10,3,4)): "dimgrey_cavefish"}
+
   def __init__(self, adev):
     self.adev = adev
     def fmt_ver(hwip): return '_'.join(map(str, adev.ip_ver[hwip]))
+    def fw_file(hwip, numeric, suffix=""):
+      return self.legacy_fw_names.get((hwip, adev.ip_ver[hwip]), numeric) + suffix + ".bin"
+    self.fw_file = fw_file
 
     # Load SOS firmware
     self.sos_fw = {}
 
-    blob, sos_hdr = self.load_fw(f"psp_{fmt_ver(am.MP0_HWIP)}_sos.bin", versioned_header='struct_psp_firmware_header')
-    fw_bin = sos_hdr.psp_fw_bin
+    blob, sos_hdr = self.load_fw(fw_file(am.MP0_HWIP, f"psp_{fmt_ver(am.MP0_HWIP)}", "_sos"),
+                                 versioned_header='struct_psp_firmware_header')
 
-    for fw_i in range(sos_hdr.psp_fw_bin_count):
-      fw_bin_desc = am.struct_psp_fw_bin_desc.from_address(ctypes.addressof(fw_bin) + fw_i * ctypes.sizeof(am.struct_psp_fw_bin_desc))
-      ucode_start_offset = fw_bin_desc.offset_bytes + sos_hdr.header.ucode_array_offset_bytes
-      self.sos_fw[fw_bin_desc.fw_type] = blob[ucode_start_offset:ucode_start_offset+fw_bin_desc.size_bytes]
+    if hasattr(sos_hdr, 'psp_fw_bin'):
+      # v2.x: a packed descriptor table, each entry naming its own PSP_FW_TYPE.
+      ucode_start = sos_hdr.header.ucode_array_offset_bytes
+      for fw_i in range(sos_hdr.psp_fw_bin_count):
+        fw_bin_desc = am.struct_psp_fw_bin_desc.from_address(ctypes.addressof(sos_hdr.psp_fw_bin)
+                                                             + fw_i * ctypes.sizeof(am.struct_psp_fw_bin_desc))
+        off = fw_bin_desc.offset_bytes + ucode_start
+        self.sos_fw[fw_bin_desc.fw_type] = blob[off:off+fw_bin_desc.size_bytes]
+    else:
+      # v1.x: named legacy descriptors instead of a table. These are two entirely different
+      # formats, which is why the kernel switches on header_version_major (amdgpu_psp.c:3443)
+      # rather than treating it as a layout tweak. Navi 2x ships v1.3.
+      v1_1 = getattr(sos_hdr, 'v1_1', sos_hdr)
+      v1_0 = getattr(v1_1, 'v1_0', v1_1)
+      ucode_start = v1_0.header.ucode_array_offset_bytes
+      # sys is everything ahead of sos rather than a descriptor of its own (amdgpu_psp.c:3390).
+      descs = [(am.PSP_FW_TYPE_PSP_SYS_DRV, 0, v1_0.sos.offset_bytes),
+               (am.PSP_FW_TYPE_PSP_SOS, v1_0.sos.offset_bytes, v1_0.sos.size_bytes)]
+      for fw_type, attr, holder in ((am.PSP_FW_TYPE_PSP_TOC, 'toc', v1_1), (am.PSP_FW_TYPE_PSP_KDB, 'kdb', v1_1),
+                                    (am.PSP_FW_TYPE_PSP_SPL, 'spl', sos_hdr), (am.PSP_FW_TYPE_PSP_RL, 'rl', sos_hdr)):
+        if (d:=getattr(holder, attr, None)) is not None: descs.append((fw_type, d.offset_bytes, d.size_bytes))
+      # A zero-size descriptor means this part does not carry that component -- Navi 23's RL is
+      # empty. Offering it anyway would hand the PSP a zero-length load, so it is left out and
+      # the callers that need it test membership instead.
+      for fw_type, off, size in descs:
+        if size: self.sos_fw[fw_type] = blob[ucode_start+off:ucode_start+off+size]
 
     # Load other fw
     self.ucode_start: dict[str, int] = {}
@@ -43,8 +76,12 @@ class AMFirmware:
 
     # SMU firmware
     if adev.ip_ver[am.MP1_HWIP] != (13,0,12):
-      blob, hdr = self.load_fw(f"smu_{fmt_ver(am.MP1_HWIP)}.bin", versioned_header="struct_smc_firmware_header")
-      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
+      blob, hdr = self.load_fw(fw_file(am.MP1_HWIP, f"smu_{fmt_ver(am.MP1_HWIP)}"), versioned_header="struct_smc_firmware_header")
+      # The P2S branch below reads hdr.pptable_count, a field that exists only on
+      # smc_firmware_header v2_1 -- the MI300 format. Navi 2x ships v2_0 (ppt_offset_bytes, no
+      # pptable_count), so the old GC >= (11,0,0) split sent gfx10.3 down the MI path and raised
+      # AttributeError. MI300 is GC 9.4.3, so >= (10,0,0) is the split that separates the two.
+      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
         self.smu_psp_desc = self.desc(blob, hdr.v1_0.header.ucode_array_offset_bytes, hdr.v1_0.header.ucode_size_bytes, am.GFX_FW_TYPE_SMU)
       else:
         p2stables = (am.struct_smc_soft_pptable_entry * hdr.pptable_count).from_buffer(blob[hdr.pptable_entry_offset:])
@@ -53,25 +90,44 @@ class AMFirmware:
             self.descs += [self.desc(blob, p2stable.ppt_offset_bytes, p2stable.ppt_size_bytes, am.GFX_FW_TYPE_P2S_TABLE)]
 
     # SDMA firmware
-    blob, hdr = self.load_fw(f"sdma_{fmt_ver(am.SDMA0_HWIP)}.bin", versioned_header="struct_sdma_firmware_header")
+    blob, hdr = self.load_fw(fw_file(am.SDMA0_HWIP, f"sdma_{fmt_ver(am.SDMA0_HWIP)}"), versioned_header="struct_sdma_firmware_header")
     if hdr.header.header_version_major == 1:
-      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, am.GFX_FW_TYPE_SDMA0,
-                               am.GFX_FW_TYPE_SDMA1, am.GFX_FW_TYPE_SDMA2, am.GFX_FW_TYPE_SDMA3)]
+      # Sienna Cichlid's PSP takes exactly one SDMA blob and applies it to every engine -- the
+      # kernel skips SDMA1/2/3 for MP0 11.0.7/11.0.11/11.0.12 by name, "as all four sdma fw are
+      # same" (amdgpu_psp.c:2839-2848). Sending the other three would be three LOAD_IP_FW
+      # commands for engines this part does not have.
+      one_sdma = self.adev.ip_ver[am.MP0_HWIP] in {(11,0,7), (11,0,11), (11,0,12)}
+      sdma_types = (am.GFX_FW_TYPE_SDMA0,) if one_sdma else (am.GFX_FW_TYPE_SDMA0, am.GFX_FW_TYPE_SDMA1,
+                                                             am.GFX_FW_TYPE_SDMA2, am.GFX_FW_TYPE_SDMA3)
+      self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.header.ucode_size_bytes, *sdma_types)]
     elif hdr.header.header_version_major == 2:
       self.descs += [self.desc(blob, hdr.ctl_ucode_offset, hdr.ctl_ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH1)]
       self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.ctx_ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH0)]
     else: self.descs += [self.desc(blob, hdr.header.ucode_array_offset_bytes, hdr.ucode_size_bytes, am.GFX_FW_TYPE_SDMA_UCODE_TH0)]
 
-    # PFP, ME, MEC firmware
-    for (fw_name, fw_cnt) in ([('PFP', 1), ('ME', 1)] if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else []) + [('MEC', 1)]:
-      blob, hdr = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_{fw_name.lower()}.bin", versioned_header="struct_gfx_firmware_header")
+    # PFP, ME, CE, MEC firmware
+    # gfx11 has the RLC load the graphics engines out of its autoload image, so AM never needed
+    # PFP/ME there. gfx10.3 does not work that way: gfx_v10_0.c:4138-4174 hands CP_PFP, CP_ME,
+    # CP_CE and CP_MEC1(+JT) to the PSP individually, and gfx10 keeps a separate CE that gfx11
+    # dropped. They go ahead of MEC to match the order the kernel walks (amdgpu_ucode.h:478-492).
+    gfx10_cp = [('PFP', 1), ('ME', 1), ('CE', 1)] if (10,0,0) <= self.adev.ip_ver[am.GC_HWIP] < (11,0,0) else []
+    for (fw_name, fw_cnt) in ([('PFP', 1), ('ME', 1)] if self.adev.ip_ver[am.GC_HWIP] >= (12,0,0) else []) + gfx10_cp + [('MEC', 1)]:
+      blob, hdr = self.load_fw(fw_file(am.GC_HWIP, f"gc_{fmt_ver(am.GC_HWIP)}", f"_{fw_name.lower()}"), versioned_header="struct_gfx_firmware_header")
 
       ucode_off = hdr.header.ucode_array_offset_bytes
       if hdr.header.header_version_major == 1:
-        # Code
-        self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes - hdr.jt_size * 4, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}'))]
-        # JT
-        self.descs += [self.desc(blob, ucode_off + hdr.jt_offset * 4, hdr.jt_size * 4, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}_ME1'))]
+        if fw_name == 'MEC':
+          # Only MEC carries a jump table the PSP wants as a load of its own, and only MEC has
+          # it subtracted from the main ucode (amdgpu_ucode.c:872-878; PFP/ME/CE fall to the
+          # default case at :1024 and keep their full size). There is also no
+          # GFX_FW_TYPE_CP_PFP_ME1 to name, so the JT desc cannot be built by string for them.
+          self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes - hdr.jt_size * 4, am.GFX_FW_TYPE_CP_MEC)]
+          # An autoload PSP builds the jump table itself and rejects being handed one --
+          # fw_load_skip_check() drops CP_MEC1_JT for exactly these parts (amdgpu_psp.c:2780).
+          if not psp_autoload_supported(self.adev.ip_ver[am.MP0_HWIP]):
+            self.descs += [self.desc(blob, ucode_off + hdr.jt_offset * 4, hdr.jt_size * 4, am.GFX_FW_TYPE_CP_MEC_ME1)]
+        else:
+          self.descs += [self.desc(blob, ucode_off, hdr.header.ucode_size_bytes, getattr(am, f'GFX_FW_TYPE_CP_{fw_name}'))]
       else:
         # Code
         self.descs += [self.desc(blob, ucode_off, hdr.ucode_size_bytes, getattr(am, f'GFX_FW_TYPE_RS64_{fw_name}'))]
@@ -82,12 +138,12 @@ class AMFirmware:
 
     # IMU firmware
     if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
-      blob, hdr = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_imu.bin", am.struct_imu_firmware_header_v1_0)
+      blob, hdr = self.load_fw(fw_file(am.GC_HWIP, f"gc_{fmt_ver(am.GC_HWIP)}", "_imu"), am.struct_imu_firmware_header_v1_0)
       imu_i_off, imu_i_sz, imu_d_sz = hdr.header.ucode_array_offset_bytes, hdr.imu_iram_ucode_size_bytes, hdr.imu_dram_ucode_size_bytes
       self.descs += [self.desc(blob, imu_i_off, imu_i_sz, am.GFX_FW_TYPE_IMU_I), self.desc(blob, imu_i_off+imu_i_sz, imu_d_sz, am.GFX_FW_TYPE_IMU_D)]
 
     # RLC firmware
-    blob, hdr0, hdr1, hdr2, hdr3 = self.load_fw(f"gc_{fmt_ver(am.GC_HWIP)}_rlc.bin", am.struct_rlc_firmware_header_v2_0,
+    blob, hdr0, hdr1, hdr2, hdr3 = self.load_fw(fw_file(am.GC_HWIP, f"gc_{fmt_ver(am.GC_HWIP)}", "_rlc"), am.struct_rlc_firmware_header_v2_0,
       am.struct_rlc_firmware_header_v2_1, am.struct_rlc_firmware_header_v2_2, am.struct_rlc_firmware_header_v2_3)
 
     if hdr0.header.header_version_minor == 1:

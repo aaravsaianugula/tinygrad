@@ -1,4 +1,14 @@
 hashes = {
+  # Navi 2x (RDNA2) ships under codenames, see AMFirmware.legacy_fw_names.
+  'dimgrey_cavefish_sos.bin': 'ec4ac3c065b814ad164eb6d19f2009c225baed0eb52a7bcbaae324c4b0be11b2',
+  'dimgrey_cavefish_smc.bin': '73d5e7f4a8d510372ef256165d8519f17e1275b32698451a51fb3b053f774844',
+  'dimgrey_cavefish_sdma.bin': '2f1fde6276766222b1cd3c8a447cb622026d2d4e537fdb7e3d80780953c7d925',
+  'dimgrey_cavefish_mec.bin': 'f1bd4659b59e5b7b222711d60cc0080c8d98eeabd4f6138aeca785b90c05af1a',
+  'dimgrey_cavefish_mec2.bin': 'f1bd4659b59e5b7b222711d60cc0080c8d98eeabd4f6138aeca785b90c05af1a',
+  'dimgrey_cavefish_rlc.bin': '4ad937c4c2e165acf9ab47dec33a801bc75901b85615921eb23835594ba4eeca',
+  'dimgrey_cavefish_pfp.bin': 'c24575d0a9c6cc2559dfa8bc130c89d656886a071e0c1a91cb975b4b931a6eb2',
+  'dimgrey_cavefish_me.bin': 'adc9e9ce1ea77e12f5eb1b71ab9df1c1ead8bec0da8679807fdcf4beddc705ab',
+  'dimgrey_cavefish_ce.bin': 'f19c49f9f403dda521d5eda8e08131f52ce5598d898c5747078e6fbb6e4893ff',
   'psp_13_0_0_sos.bin': 'b5592f46885585b935e013f46c949db8ff2f15c0b346caf70e7fcd2776623d13',
   'psp_13_0_10_sos.bin': '0bcaaad9cd8578d3841ae69155a6bd4fc3ceae8f4fb5a6ba4f576e7ace94d1d9',
   'psp_13_0_12_sos.bin': '89da90bf4286b38678b1fd175c78462a426afa3d258d15872cd14072d7098b9b',

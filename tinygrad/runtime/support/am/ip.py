@@ -34,7 +34,10 @@ class AM_SOC(AM_IP):
         self.adev.indirect_wreg_pcie(self.adev.regXCC_DOORBELL_FENCE.addr[0], self.adev.regXCC_DOORBELL_FENCE.encode(shub_slv_mode=1), aid=aid)
       self.adev.regBIFC_GFX_INT_MONITOR_MASK.write(0x7ff)
       self.adev.regBIFC_DOORBELL_ACCESS_EN_PF.write(0xfffff)
-    else: self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
+    # nbio 2.3 has no such register and nbio_v2_3.c never writes one: this is an errata write
+    # that arrives with nbio 4.3 (nbio_v4_3.c:337) and nbif 6.3 (nbif_v6_3_1.c:295). MI300's
+    # nbio 7.9 takes the branch above.
+    elif self.adev.ip_ver[am.NBIO_HWIP] >= (4,0,0): self.adev.regRCC_DEV0_EPF2_STRAP2.update(strap_no_soft_reset_dev0_f2=0x0)
     self.adev.regRCC_DEV0_EPF0_RCC_DOORBELL_APER_EN.write(0x1)
   def set_clockgating_state(self):
     if self.adev.ip_ver[am.HDP_HWIP] >= (5,2,1): self.adev.regHDP_MEM_POWER_CTRL.update(atomic_mem_power_ctrl_en=1, atomic_mem_power_ds_en=1)
@@ -261,7 +264,11 @@ class AM_GFX(AM_IP):
     self._config_mec()
 
     # NOTE: Golden reg for gfx11. No values for this reg provided. The kernel just ors 0x20000000 to this reg.
-    for xcc in range(self.xccs): self.adev.regTCP_CNTL.write(self.adev.regTCP_CNTL.read() | 0x20000000, inst=xcc)
+    # Not gfx10: there 0x20000000 is DB_DEBUG's golden value, and mmTCP_CNTL's is 0x479c0010
+    # (gfx_v10_0.c:492). Applying the gfx11 or-mask here would write the wrong value, so gfx10.3
+    # skips it -- its golden registers are their own job.
+    if self.adev.ip_ver[am.GC_HWIP][0] != 10:
+      for xcc in range(self.xccs): self.adev.regTCP_CNTL.write(self.adev.regTCP_CNTL.read() | 0x20000000, inst=xcc)
 
     for xcc in range(self.xccs): self.adev.regRLC_CNTL.write(0x1, inst=xcc)
 
@@ -358,7 +365,9 @@ class AM_GFX(AM_IP):
 
       self.adev.regCP_RB_WPTR_POLL_CNTL.update(poll_frequency=0x100, idle_poll_count=0x90, inst=xcc)
       self.adev.regCP_INT_CNTL.update(cntx_busy_int_enable=1, cntx_empty_int_enable=1, cmp_busy_int_enable=1, inst=xcc)
-      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
+      # These arrive with gfx11 -- they are absent from the gfx10.3 and gfx9.4 register sets, and
+      # sdma_v5_2.c writes no SDMA CGCG register at all for Navi 2x.
+      if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0):
         self.adev.regSDMA0_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
         self.adev.regSDMA1_RLC_CGCG_CTRL.update(cgcg_int_enable=1, inst=xcc)
 
@@ -430,7 +439,8 @@ class AM_IH(AM_IP):
     if self.adev.ip_ver[am.OSSSYS_HWIP] != (4,4,2):
       self.adev.regIH_STORM_CLIENT_LIST_CNTL.update(client18_is_storm_client=1)
       self.adev.regIH_INT_FLOOD_CNTL.update(flood_cntl_enable=1)
-      self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
+      # OSSSYS 5 has no MSI storm register, and navi10_ih.c programs no storm block on Navi 2x.
+      if self.adev.ip_ver[am.OSSSYS_HWIP] >= (6,0,0): self.adev.regIH_MSI_STORM_CTRL.update(delay=3)
 
     # toggle interrupts
     for _, rwptr_vm, suf, ring_id in self.rings:
@@ -556,6 +566,17 @@ class AM_SDMA(AM_IP):
     self.adev.reg(f"{reg}_IB_CNTL").update(ib_enable=1, inst=inst)
     return doorbell
 
+def psp_autoload_supported(mp0:tuple[int, int, int]) -> bool:
+  """Whether the PSP builds the GFX image itself instead of taking a reg list.
+
+  amdgpu_psp.c:167 turns this on by default and switches it off for a fixed list of MP0
+  versions; this is that list. It decides three things, which is why it is worth naming once:
+  the RLC autoload command, whether the MEC jump table is sent at all, and whether SMU goes
+  through the ordinary firmware list.
+  """
+  return mp0 not in {(9,0,0), (10,0,0), (10,0,1), (11,0,2), (11,0,3), (11,0,4), (11,0,8),
+                     (12,0,1), (13,0,2), (13,0,6), (13,0,14)}
+
 class AM_PSP(AM_IP):
   def init_sw(self):
     self.reg_pref = "regMP0_SMN_C2PMSG" if self.adev.ip_ver[am.MP0_HWIP] < (14,0,0) else "regMPASP_SMN_C2PMSG"
@@ -580,7 +601,10 @@ class AM_PSP(AM_IP):
     self.tmr_paddr = self.adev.mm.palloc(self.max_tmr_size, align=am.PSP_TMR_ALIGNMENT, zero=False, boot=True) if not self.boot_time_tmr else 0
 
   def init_hw(self):
-    spl_key = am.PSP_FW_TYPE_PSP_SPL if self.adev.ip_ver[am.MP0_HWIP] >= (14,0,0) else am.PSP_FW_TYPE_PSP_KDB
+    # psp_v13 carries no separate SPL blob and reuses KDB for the SPL slot; psp_v11 and psp_v14
+    # both ship a real one (Navi 23's is 928 bytes), and sending KDB twice leaves the SPL table
+    # unloaded. Only MP0 13.x takes the substitution.
+    spl_key = am.PSP_FW_TYPE_PSP_KDB if self.adev.ip_ver[am.MP0_HWIP][0] == 13 else am.PSP_FW_TYPE_PSP_SPL
     sos_components = [(am.PSP_FW_TYPE_PSP_KDB, am.PSP_BL__LOAD_KEY_DATABASE), (spl_key, am.PSP_BL__LOAD_TOS_SPL_TABLE),
       (am.PSP_FW_TYPE_PSP_SYS_DRV, am.PSP_BL__LOAD_SYSDRV), (am.PSP_FW_TYPE_PSP_SOC_DRV, am.PSP_BL__LOAD_SOCDRV),
       (am.PSP_FW_TYPE_PSP_INTF_DRV, am.PSP_BL__LOAD_INTFDRV), (am.PSP_FW_TYPE_PSP_DBG_DRV, am.PSP_BL__LOAD_DBGDRV),
@@ -599,8 +623,13 @@ class AM_PSP(AM_IP):
 
     for psp_desc in self.adev.fw.descs: self._load_ip_fw_cmd(*psp_desc)
 
-    if self.adev.ip_ver[am.GC_HWIP] >= (11,0,0): self._rlc_autoload_cmd()
-    else: self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
+    # Autoload is a property of the PSP, not of GC: amdgpu leaves psp->autoload_supported set for
+    # MP0 11.0.12 and psp_load_non_psp_fw() fires GFX_CMD_ID_AUTOLOAD_RLC for it by name
+    # (amdgpu_psp.c:2800). Keying this on GC >= 11 sent Navi 23 down the gfx9 REG_LIST path
+    # instead -- and its RL descriptor is empty, so that path could only ever have raised.
+    if psp_autoload_supported(self.adev.ip_ver[am.MP0_HWIP]): self._rlc_autoload_cmd()
+    elif am.PSP_FW_TYPE_PSP_RL in self.adev.fw.sos_fw:
+      self._load_ip_fw_cmd([am.GFX_FW_TYPE_REG_LIST], self.adev.fw.sos_fw[am.PSP_FW_TYPE_PSP_RL])
 
   def is_sos_alive(self): return self.adev.reg(f"{self.reg_pref}_81").read() != 0x0
 
