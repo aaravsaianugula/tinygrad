@@ -53,7 +53,9 @@ def import_pmc(ip) -> dict[str, tuple[str, int]]:
 # nbio_2_3 predates the BIF_BX0_/BIF_BX_PF0_ prefixes -- and those need naming outright.
 legacy_reg_renames = {"regBIF_BX0_PCIE_INDEX2": "mmPCIE_INDEX2", "regBIF_BX0_PCIE_DATA2": "mmPCIE_DATA2",
                       "regBIF_BX0_BIF_DOORBELL_INT_CNTL": "mmBIF_DOORBELL_INT_CNTL",
-                      "regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL": "mmREMAP_HDP_MEM_FLUSH_CNTL"}
+                      "regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL": "mmREMAP_HDP_MEM_FLUSH_CNTL",
+                      "regBIF_BX_PF0_GPU_HDP_FLUSH_REQ": "mmBIF_BX_PF_GPU_HDP_FLUSH_REQ",
+                      "regBIF_BX_PF0_GPU_HDP_FLUSH_DONE": "mmBIF_BX_PF_GPU_HDP_FLUSH_DONE"}
 
 def alias_legacy_regs(regs:dict) -> dict:
   # Registers that do not exist on the older silicon are deliberately left absent rather than

@@ -970,7 +970,10 @@ class AMDDevice(HCQCompiled):
 
     self.target:tuple[int, ...] = ((trgt:=self.iface.props['gfx_target_version']) // 10000, (trgt // 100) % 100, trgt % 100)
     self.arch = "gfx%d%x%x" % self.target
-    assert (self.target in ((9,4,2),(9,5,0))) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
+    # gfx10.3 (RDNA2) admitted once the driver actually brought one up: PSP, SOC, GMC, IH, SMU,
+    # GFX and SDMA all initialize on a Navi 23 over a USB4 dock. gfx10.1 is deliberately not
+    # here -- nothing has run one.
+    assert (self.target in ((9,4,2),(9,5,0))) or self.target[:2] == (10,3) or self.target[0] in (11, 12), f"Unsupported arch: {self.arch}"
     if DEBUG >= 1: print(f"AMDDevice: opening {self.device_id} with target {self.target} arch {self.arch}")
 
     self.xccs = self.iface.props.get('num_xcc', 1)
@@ -1087,7 +1090,11 @@ class AMDDevice(HCQCompiled):
       wave_scratch = ceildiv(lanes_per_wave * size_per_thread, mem_alignment_size)
       num_waves = (size_per_xcc // (wave_scratch * mem_alignment_size)) // (self.se_cnt if self.target[0] != 9 else 1)
 
-      tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"_GFX"+str(self.target[0]) if self.target[0] != 9 else ""}_bitfields')
+      # gfx10 splits COMPUTE_TMPRING_SIZE the same way gfx9 does -- WAVES 0:11, WAVESIZE 12:24 --
+      # so it shares the unsuffixed union. gfx11 widened WAVESIZE to 12:26 and gfx12 to 12:29,
+      # which is why those have their own; ROCR ships no GFX10 variant because there is nothing
+      # to vary. Reading the suffix off the major alone asked for a union that does not exist.
+      tmpring_t = getattr(hsa, f'union_COMPUTE_TMPRING_SIZE{"" if self.target[0] in (9, 10) else "_GFX"+str(self.target[0])}_bitfields')
       self.tmpring_size = int.from_bytes(tmpring_t(WAVES=min(num_waves, max_scratch_waves), WAVESIZE=wave_scratch), 'little')
       self.max_private_segment_size = private_segment_size
 

@@ -589,7 +589,12 @@ class AM_SDMA(AM_IP):
     if self.adev.ip_ver[am.SDMA0_HWIP] >= (5,0,0) and idx > 0: raise RuntimeError(f"am {self.adev.devfmt}: sdma queue {idx} is not available")
 
     pipe, queue = idx // 4, idx % 4
-    reg, inst = ("regSDMA_GFX", pipe+queue*4) if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4) else (f"regSDMA{pipe}_QUEUE{queue}", 0)
+    # Three different spellings of the same ring across three generations: MI300 (4.4) has one
+    # SDMA_GFX block addressed by instance, SDMA 5.x names it SDMA{i}_GFX, and 6.x onward
+    # names it SDMA{i}_QUEUE{q}. gc_10_3_0 carries 45 SDMA0_GFX_* registers and no QUEUE0 at all.
+    if self.adev.ip_ver[am.SDMA0_HWIP][:2] == (4,4): reg, inst = "regSDMA_GFX", pipe+queue*4
+    elif self.adev.ip_ver[am.SDMA0_HWIP] < (6,0,0): reg, inst = f"regSDMA{pipe}_GFX", 0
+    else: reg, inst = f"regSDMA{pipe}_QUEUE{queue}", 0
     doorbell = am.AMDGPU_NAVI10_DOORBELL_sDMA_ENGINE0 + (pipe+queue*4) * 0xA
     self.sdma_reginst.append((reg, inst))
 
@@ -602,7 +607,12 @@ class AM_SDMA(AM_IP):
     self.adev.reg(f"{reg}_DOORBELL_OFFSET").update(offset=doorbell * 2, inst=inst)
     self.adev.reg(f"{reg}_DOORBELL").update(enable=1, inst=inst)
     self.adev.reg(f"{reg}_MINOR_PTR_UPDATE").write(0x0, inst=inst)
-    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if self.adev.ip_ver[am.SDMA0_HWIP][:2]!=(4,4) else {}),
+    # SDMA 6.x folded wptr polling into RB_CNTL. 5.x has no such field -- it enables polling in
+    # its own RB_WPTR_POLL_CNTL, read-modify-write, F32_POLL_ENABLE only (sdma_v5_2.c:573-579).
+    poll_in_rb_cntl = self.adev.ip_ver[am.SDMA0_HWIP] >= (6,0,0)
+    if not poll_in_rb_cntl and self.adev.ip_ver[am.SDMA0_HWIP][:2] != (4,4):
+      self.adev.reg(f"{reg}_RB_WPTR_POLL_CNTL").update(f32_poll_enable=1, inst=inst)
+    self.adev.reg(f"{reg}_RB_CNTL").write(**({f'{self.sdma_name.lower()}_wptr_poll_enable':1} if poll_in_rb_cntl else {}),
       rb_vmid=0, rptr_writeback_enable=1, rptr_writeback_timer=4, rb_enable=1, rb_priv=1, rb_size=(ring_size//4).bit_length()-1, inst=inst)
     self.adev.reg(f"{reg}_IB_CNTL").update(ib_enable=1, inst=inst)
     return doorbell

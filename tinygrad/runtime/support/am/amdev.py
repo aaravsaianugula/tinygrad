@@ -1,12 +1,12 @@
 from __future__ import annotations
-import ctypes, collections, dataclasses, functools, hashlib, array
+import ctypes, collections, contextlib, dataclasses, functools, hashlib, array
 from tinygrad.helpers import mv_address, getenv, DEBUG, lo32, hi32, fetch_fw
 from tinygrad.runtime.autogen import pci
 from tinygrad.runtime.autogen.am import am, fw
 from tinygrad.runtime.support.amd import AMDReg, import_module, import_asic_regs
 from tinygrad.runtime.support.memory import TLSFAllocator, MemoryManager, AddrSpace
 from tinygrad.runtime.support.system import PCIDevice
-from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA, psp_autoload_supported
+from tinygrad.runtime.support.am.ip import AM_IP, AM_SOC, AM_GMC, AM_IH, AM_PSP, AM_SMU, AM_GFX, AM_SDMA, psp_autoload_supported, SMUError
 
 AM_DEBUG = getenv("AM_DEBUG", 0)
 
@@ -243,10 +243,19 @@ class AMDev:
     # Re-initialize main blocks
     self.init_hw(self.gfx, self.sdma)
 
-    if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
-      self.smu.set_power_limit(max_power)
-      self.smu.set_clocks(level=None)
-    else: self.smu.set_clocks(level=-1) # last level, max perf.
+    # Clock control is a performance step, not a correctness one: a card whose SMU declines to
+    # hand over its DPM tables still executes kernels, it just may not boost. Refusing to build
+    # the device over that would be worse than running slow, so a refusal is caught -- and said
+    # out loud, because a card silently stuck at boot clocks is its own kind of wrong answer.
+    # Only SMUError is caught: that is the SMU answering "no", which is a fact about the card.
+    # A timeout still propagates, because that is the SMU not answering at all.
+    try:
+      if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
+        self.smu.set_power_limit(max_power)
+        self.smu.set_clocks(level=None)
+      else: self.smu.set_clocks(level=-1) # last level, max perf.
+    except SMUError as e:
+      print(f"am {self.devfmt}: running at the SMU's default clocks, it refused to set them: {e}")
     for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
     self.reg("regSCRATCH_REG7").write(AMDev.Version)
     self.reg("regSCRATCH_REG6").write(1) # set initialized state.
@@ -281,7 +290,11 @@ class AMDev:
   def fini(self):
     if DEBUG >= 2: print(f"am {self.devfmt}: Finalizing")
     for ip in [self.sdma, self.gfx]: ip.fini_hw()
-    self.smu.set_clocks(level=0)
+    # Dropping to the lowest clock on the way out is courtesy, not teardown: a card whose SMU
+    # would not set clocks on the way in will not set them on the way out either, and an SMUError
+    # escaping here surfaces as an "exception ignored in atexit callback" traceback that says
+    # nothing about the run that just finished. The rest of fini still has to happen.
+    with contextlib.suppress(SMUError): self.smu.set_clocks(level=0)
     self.ih.interrupt_handler()
     self.reg("regSCRATCH_REG6").write(self.is_err_state) # set finalized state.
 
