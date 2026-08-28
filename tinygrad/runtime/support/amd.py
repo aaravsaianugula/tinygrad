@@ -47,5 +47,26 @@ def import_pmc(ip) -> dict[str, tuple[str, int]]:
   # NOTE: precise arch for mi300+, generic for others, since rocm headers lack some archs
   return {k:x for k,v in pmc.counters.items() if (x:=v.get(f"gfx{ip[0]}{ip[1]:x}{ip[2]:x}" if ip[0] == 9 else f"gfx{ip[0]}", None)) is not None}
 
+# gfx10-era AMD headers spell every register mm*; gfx11 and later spell them reg*, and AM is
+# written entirely in reg*. AMDev.reg() is a bare __dict__ lookup, so without an alias not one
+# register on a Navi 2x card resolves. A few registers moved rather than being re-spelled --
+# nbio_2_3 predates the BIF_BX0_/BIF_BX_PF0_ prefixes -- and those need naming outright.
+legacy_reg_renames = {"regBIF_BX0_PCIE_INDEX2": "mmPCIE_INDEX2", "regBIF_BX0_PCIE_DATA2": "mmPCIE_DATA2",
+                      "regBIF_BX0_BIF_DOORBELL_INT_CNTL": "mmBIF_DOORBELL_INT_CNTL",
+                      "regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL": "mmREMAP_HDP_MEM_FLUSH_CNTL"}
+
+def alias_legacy_regs(regs:dict) -> dict:
+  # Registers that do not exist on the older silicon are deliberately left absent rather than
+  # aliased to something near them, so a code path that is wrong for this generation raises
+  # instead of quietly reading an unrelated offset.
+  if not any(name.startswith("mm") for name in regs): return regs
+  aliased = dict(regs)
+  for name, val in regs.items():
+    if name.startswith("mm"): aliased.setdefault("reg"+name[2:], val)
+  for new, old in legacy_reg_renames.items():
+    if old in regs: aliased.setdefault(new, regs[old])
+  return aliased
+
 def import_asic_regs(prefix:str, version:tuple[int, int, int], cls=AMDReg) -> dict[str, AMDReg]:
-  return {reg:cls(name=reg, offset=off, segment=seg, fields=fields) for reg,(off,seg,fields) in import_module(prefix, version, submod="regs").items()}
+  regs = alias_legacy_regs(import_module(prefix, version, submod="regs"))
+  return {reg:cls(name=reg, offset=off, segment=seg, fields=fields) for reg,(off,seg,fields) in regs.items()}
