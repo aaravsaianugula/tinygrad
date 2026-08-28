@@ -33,9 +33,12 @@ header_renames = {"mp_11_0_0": "mp_11_0", "nbio_2_3_0": "nbio_2_3"}
 reg_patterns = {
   "gc": ["GCVM", "GCMC_VM", "CP_(HQD|MQD|MEC|ME_CNTL|PERFMON|RB_WPTR_POLL_CNTL|INT_CNTL|STAT|PFP_PRGRM|ME_PRGRM|COHER_START)", "COMPUTE_",
          "(SQ|GL2C|TCC)_PERFCOUNTER", "SQ_THREAD_TRACE", "SPI_(CONFIG_CNTL|COMPUTE_QUEUE_RESET)", "GRBM", "SH_MEM", "RLC", "TCP", "GB_ADDR_CONFIG",
-         "SDMA[01]_(WATCHDOG_CNTL|UTCL1_(CNTL|PAGE)|MCU_CNTL|F32_CNTL|CNTL|QUEUE0_|RLC_CGCG_CTRL)", "SCRATCH_REG[67]"],
+         "SDMA[01]_(WATCHDOG_CNTL|UTCL1_(CNTL|PAGE)|MCU_CNTL|F32_CNTL|CNTL|QUEUE0_|GFX_|RLC_CGCG_CTRL)", "SCRATCH_REG[67]"],
   "mmhub": ["MMVM", "MMMC_VM", "MM_ATC_L2_MISC_CG"],
-  # The last four entries are RDNA2's spellings of registers the earlier ones name for gfx11+.
+  # The last five entries are RDNA2's spellings of registers the earlier ones name for gfx11+.
+  # BIF_*_DOORBELL_RANGE is not a spelling difference: nbio 2.3 has no S2A doorbell router,
+  # it gives each client its own range register (nbio_v2_3.c:109), so those are extra rows
+  # rather than renames and only ever appear on the older header.
   # nbio_2_3 predates the BIF_BX0_/BIF_BX_PF0_ prefixes and the reg* rename, so the same
   # hardware appears as mmPCIE_INDEX2, mmBIF_DOORBELL_INT_CNTL, mmREMAP_HDP_MEM_FLUSH_CNTL and
   # mmBIF_BX_PF_GPU_HDP_FLUSH_REQ. Matching is anchored, so these cannot pull in the gfx11
@@ -43,7 +46,8 @@ reg_patterns = {
   "nbio": (nbio:=["BIF_BX_PF[01]_GPU_HDP_FLUSH", "BIF_BX_PF0_RSMU", "BIF_BX0_(REMAP_HDP_MEM_FLUSH_CNTL|BIF_DOORBELL_INT_CNTL|PCIE_INDEX2|PCIE_DATA2)",
                   "BIFC_(DOORBELL_ACCESS_EN_PF|GFX_INT_MONITOR_MASK)", "XCC_DOORBELL_FENCE", "DOORBELL0_CTRL_ENTRY", "GDC_S2A0_S2A_DOORBELL_ENTRY",
                   "S2A_DOORBELL_ENTRY", "RCC_DEV0_EPF0_RCC_DOORBELL_APER_EN", "RCC_DEV0_EPF2_STRAP2",
-                  "PCIE_(INDEX2|DATA2)", "BIF_DOORBELL_INT_CNTL", "REMAP_HDP_MEM_FLUSH_CNTL", "BIF_BX_PF_GPU_HDP_FLUSH"]),
+                  "PCIE_(INDEX2|DATA2)", "BIF_DOORBELL_INT_CNTL", "REMAP_HDP_MEM_FLUSH_CNTL", "BIF_BX_PF_GPU_HDP_FLUSH",
+                  "BIF_(SDMA[0-9]+|IH)_DOORBELL_RANGE"]),
   "nbif": nbio,
   "mp": ["MP([01]|ASP)_SMN_C2PMSG"], "hdp": ["HDP_MEM_POWER_CTRL"], "oss": ["IH_"], "sdma": ["SDMA_GFX", "SDMA_CNTL"]
 }
