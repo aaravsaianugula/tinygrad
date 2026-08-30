@@ -1,6 +1,6 @@
-import ctypes, struct, time, functools, itertools
+import ctypes, struct, time, functools, itertools, collections, contextlib, sys
 from tinygrad.runtime.autogen import libusb
-from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv
+from tinygrad.helpers import DEBUG, DEV, to_mv, round_up, ceildiv, getenv
 from tinygrad.runtime.support.hcq import MMIOInterface
 from tinygrad.runtime.support import c
 
@@ -201,3 +201,120 @@ class USBMMIOInterface(MMIOInterface):
     return USBMMIOInterface(self.usb, self.addr+offset, self.nbytes-offset if size is None else size, fmt=fmt or self.fmt, pcimem=self.pcimem)
 
 if DEV.interface.startswith("MOCK"): from test.mockgpu.usb import MockUSB3 as USB3  # type: ignore  # noqa: F811
+
+# ***** USB transport statistics *****
+#
+# Every access this GPU's driver makes crosses this file, and over USB a single 64-bit store can
+# become eight control transfers. USB_STATS makes that visible. Three layers are counted:
+#
+#   mmio        USBMMIOInterface item access -- one device memory read/write, as the rest of tinygrad sees it
+#   controller  CustomASM24Controller ops    -- the bridge operation that access turned into
+#   transport   USB3 libusb transfers        -- the URBs actually on the wire
+#
+# Only the transport layer's time is wall time on the link; the two outer layers contain it and are
+# there to say who asked for it. With USB_STATS=2 every call additionally records the first stack
+# frame outside this file, so a hot call site is named by file:line instead of guessed at -- that
+# frame walk is not free, so use USB_STATS=1 for headline timings and 2 for attribution.
+#
+# Nothing is wrapped unless USB_STATS is set, so a normal run keeps the original methods.
+
+USB_STATS = getenv("USB_STATS", 0)
+_STATS_FILE = __file__
+
+class USBStats:
+  """Process-global USB counters. counters[method] and sites[key] are [calls, payload_bytes, seconds]."""
+
+  LAYERS: dict[str, tuple[str, ...]] = {
+    "mmio": ("__getitem__", "__setitem__"),
+    "controller": ("pcie_request", "pcie_cfg_req", "pcie_mem_write", "pcie_mem_read", "read", "write",
+                   "scsi_write", "scsi_read_arm", "scsi_read"),
+    "transport": ("control_write", "control_read", "bulk_write", "bulk_read"),
+  }
+
+  counters: dict[str, list] = collections.defaultdict(lambda: [0, 0, 0.0])
+  sites: dict[str, list] = collections.defaultdict(lambda: [0, 0, 0.0])
+  regions: dict[str, list] = collections.defaultdict(lambda: [0, 0.0, 0.0]) # [entries, wall_s, usb_wall_s]
+
+  @classmethod
+  def reset(cls):
+    """Drop everything counted so far. Call after warmup so setup traffic is not mixed into a frame."""
+    cls.counters.clear()
+    cls.sites.clear()
+    cls.regions.clear()
+
+  @classmethod
+  def transport_secs(cls) -> float: return sum(cls.counters[m][2] for m in cls.LAYERS["transport"])
+
+  @classmethod
+  @contextlib.contextmanager
+  def region(cls, name:str):
+    """Time a caller-defined region together with the USB wall time spent inside it. The difference
+    between the two is the region's own host-side time, which is the only way to separate python
+    from the link without a profiler that would itself dominate."""
+    st, usb_st = time.perf_counter(), cls.transport_secs()
+    try: yield
+    finally:
+      r = cls.regions[name]
+      r[0], r[1], r[2] = r[0] + 1, r[1] + (time.perf_counter() - st), r[2] + (cls.transport_secs() - usb_st)
+
+  @classmethod
+  def report(cls, per:int=1, top_sites:int=30) -> str:
+    """Format the counters, divided by `per` (pass the frame count to get per-frame numbers)."""
+    out = [f"--- USB_STATS ({per} frame(s), transport wall {cls.transport_secs()/per*1e3:.3f} ms/frame) ---"]
+    for layer, names in cls.LAYERS.items():
+      if not (rows:=[(n, *cls.counters[n]) for n in names if cls.counters[n][0]]): continue
+      out.append(f"  {layer}:")
+      out += [f"    {n:<16}{c/per:12.1f} calls {b/per:12.1f} B {s/per*1e3:10.3f} ms" for n, c, b, s in rows]
+    if cls.sites:
+      out.append(f"  by call site (top {top_sites} by time):")
+      for k, (c, b, s) in sorted(cls.sites.items(), key=lambda kv: -kv[1][2])[:top_sites]:
+        out.append(f"    {k:<58}{c/per:12.1f} calls {b/per:12.1f} B {s/per*1e3:10.3f} ms")
+    if cls.regions:
+      out.append("  regions (wall / usb / host):")
+      for k, (n, w, u) in sorted(cls.regions.items(), key=lambda kv: -kv[1][1]):
+        out.append(f"    {k:<40}{n/per:8.1f}x {w/per*1e3:9.3f} ms {u/per*1e3:9.3f} ms {(w-u)/per*1e3:9.3f} ms")
+    return "\n".join(out)
+
+def _stats_arg(args, kwargs, idx, name, default):
+  return kwargs[name] if name in kwargs else (args[idx] if len(args) > idx else default)
+
+def _stats_site() -> str:
+  # frame 0 is this function, 1 is the wrapper, 2 is whoever called the wrapped method. Skip on past
+  # any frame still inside this file so a transport call is attributed to its tinygrad caller.
+  f = sys._getframe(2)
+  while f is not None and f.f_code.co_filename == _STATS_FILE: f = f.f_back
+  return "?" if f is None else f"{f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_lineno}"
+
+def _stats_wrap(cls, name, nbytes):
+  fn = getattr(cls, name)
+  @functools.wraps(fn)
+  def wrapper(self, *args, **kwargs):
+    st = time.perf_counter()
+    ret = fn(self, *args, **kwargs)
+    dt, n = time.perf_counter() - st, nbytes(self, args, kwargs, ret)
+    rows = (USBStats.counters[name],) if USB_STATS < 2 else (USBStats.counters[name], USBStats.sites[f"{name} <- {_stats_site()}"])
+    for r in rows: r[0], r[1], r[2] = r[0] + 1, r[1] + n, r[2] + dt
+    return ret
+  setattr(cls, name, wrapper)
+
+def _stats_install():
+  # NOTE: USB3 is read from the module globals so the MOCK swap above is honoured.
+  for cls, name, nbytes in (
+    (USB3, "control_write", lambda s, a, k, r: len(_stats_arg(a, k, 3, "data", b""))),
+    (USB3, "control_read", lambda s, a, k, r: _stats_arg(a, k, 1, "length", 0)),
+    (USB3, "bulk_write", lambda s, a, k, r: len(_stats_arg(a, k, 0, "payload", b""))),
+    (USB3, "bulk_read", lambda s, a, k, r: len(r)),
+    (CustomASM24Controller, "pcie_request", lambda s, a, k, r: _stats_arg(a, k, 3, "size", 4)),
+    (CustomASM24Controller, "pcie_cfg_req", lambda s, a, k, r: _stats_arg(a, k, 5, "size", 4)),
+    (CustomASM24Controller, "pcie_mem_write", lambda s, a, k, r: len(_stats_arg(a, k, 1, "data", b""))),
+    (CustomASM24Controller, "pcie_mem_read", lambda s, a, k, r: _stats_arg(a, k, 1, "nbytes", 0)),
+    (CustomASM24Controller, "read", lambda s, a, k, r: _stats_arg(a, k, 1, "length", 0)),
+    (CustomASM24Controller, "write", lambda s, a, k, r: len(_stats_arg(a, k, 1, "data", b""))),
+    (CustomASM24Controller, "scsi_write", lambda s, a, k, r: len(_stats_arg(a, k, 0, "buf", b""))),
+    (CustomASM24Controller, "scsi_read_arm", lambda s, a, k, r: 0),
+    (CustomASM24Controller, "scsi_read", lambda s, a, k, r: _stats_arg(a, k, 0, "size", 0)),
+    (USBMMIOInterface, "__getitem__", lambda s, a, k, r: s._off_from_index(a[0])[1]),
+    (USBMMIOInterface, "__setitem__", lambda s, a, k, r: s._off_from_index(a[0])[1]),
+  ): _stats_wrap(cls, name, nbytes)
+
+if USB_STATS: _stats_install()

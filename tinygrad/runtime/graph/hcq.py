@@ -1,12 +1,55 @@
 import collections, time
 from typing import Any, cast
-from tinygrad.helpers import round_up, PROFILE, ALL2ALL, merge_dicts, getenv, suppress_finalizing, TracingKey, unwrap
+from tinygrad.helpers import round_up, DEBUG, PROFILE, ALL2ALL, merge_dicts, getenv, suppress_finalizing, TracingKey, unwrap
 from tinygrad.runtime.support.hcq import HCQCompiled, HCQAllocator, HCQSignal, HCQBuffer, HWQueue, HCQArgsState, BumpAllocator, MMIOInterface
 from tinygrad.device import Buffer, BufferSpec, Compiled, Device, MultiBuffer, ProfileGraphEntry, ProfileGraphEvent
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import UOp, Ops, Variable
 from tinygrad.engine.jit import GraphRunner, MultiGraphRunner
 from tinygrad.runtime.ops_rdma import RDMACopyQueue
+
+# Elide the per-dispatch wave drain on queues that support it (AMD's CS_PARTIAL_FLUSH). Off while it is being A/B'd on hardware;
+# flip the default to 1 to turn it on everywhere.
+AMD_ELIDE_FLUSH = getenv("AMD_ELIDE_FLUSH", 0)
+
+def flush_schedule(dispatches:list[int], deps:dict[int, list[int]]) -> dict[int, bool]:
+  """
+  For one compute queue, decide after which of its dispatches a wave drain has to be emitted.
+
+  `dispatches` are the queue's dispatch ids in encode order, `deps[j]` the ids -- on this same queue -- of the dispatches whose
+  memory j actually reads or overwrites. That set has to be the real dependency DAG out of DepsTracker and nothing else: the
+  previous-kernel edge that _resolve_deps folds into opt_deps exists only so the timeline signals have something to hang off,
+  and ring order already satisfies it. Only a genuine buffer dependency needs a producer's waves to have retired.
+
+  A drain waits for every wave outstanding on the device, not just one dispatch's, so a single drain covers every dispatch
+  encoded before it. That makes the rule cheap to state and easy to check: walk the queue tracking `done`, the newest dispatch
+  guaranteed to have finished, and pay for a drain only when a consumer would otherwise start while one of its producers is
+  still in flight. The drain goes on that consumer's immediate predecessor, the latest point that is still legal, which leaves
+  the whole independent run in front of it free to overlap.
+  """
+  flush = {j: False for j in dispatches}
+  done, prev = -1, None
+  for j in dispatches:
+    if (producers:=deps.get(j)) and (newest:=max(producers)) > done:
+      assert prev is not None and newest <= prev, f"dispatch {j} depends on {newest}, which is not an earlier dispatch on its queue"
+      flush[prev], done = True, prev
+    prev = j
+  return flush
+
+def flush_elision_plan(q_items:dict[Any, list[tuple[int, bool]]], q_rdeps:dict[int, list[int]], busy_queues:set) -> dict[int, bool]:
+  """
+  Decide the whole graph's drains, one queue at a time, and say which dispatches are eligible at all.
+
+  A queue only qualifies if its type opted in and if every item on it is a plain dispatch: a drain can only ride along on an exec,
+  so a queue that also carries RDMA doorbell rings has points in its order with nowhere to put one. `busy_queues` are the compute
+  queues that RDMA writes waits and signals into outside their own item order, which is the same problem seen from the other end.
+  Anything left out of the plan is encoded exactly as it was before, drained after every dispatch.
+  """
+  plan:dict[int, bool] = {}
+  for queue, items in q_items.items():
+    if not queue.supports_flush_elision or queue in busy_queues or not all(is_dispatch for _, is_dispatch in items): continue
+    plan.update(flush_schedule([j for j, _ in items], q_rdeps))
+  return plan
 
 class HCQGraph(MultiGraphRunner):
   def __init__(self, *args, **kwargs):
@@ -75,6 +118,8 @@ class HCQGraph(MultiGraphRunner):
     self.prof_graph_entries: list[ProfileGraphEntry] = []
 
     self.last_j: dict[HWQueue, int|None] = collections.defaultdict(lambda: None)
+    self.q_items: dict[HWQueue, list[tuple[int, bool]]] = collections.defaultdict(list) # per queue: (ji index, is it a dispatch)
+    self.q_rdeps: dict[int, list[int]] = {} # per ji: the real same-queue buffer dependencies, kept clear of the bookkeeping edge
     self.queue_access: dict[HWQueue, dict[HWQueue, int|None]] = collections.defaultdict(lambda: collections.defaultdict(lambda: None))
     self.dev_access: dict[HWQueue, set[HCQCompiled]] = collections.defaultdict(set)
 
@@ -130,6 +175,11 @@ class HCQGraph(MultiGraphRunner):
 
       self.ji_schedule[j] = (enqueue_dev, enqueue_queue, sync_signals, opt_deps[::-1], out_signal, None if runtime is not None else (j + 1))
 
+      # Hold on to the real dependency set separately from opt_deps, which has the previous-kernel edge mixed into it and has had
+      # the same-queue signals stripped back out again on AMD/QCOM. rdeps is the one that answers "must j wait for j' to finish".
+      self.q_items[enqueue_queue].append((j, runtime is not None))
+      self.q_rdeps[j] = sorted(v - 1 for q, v in rdeps if q is enqueue_queue)
+
       # Collect profile information if profiling is enabled.
       if PROFILE:
         # When execution are chained, we can reuse the end timestamp from the previous command as the start timestamp for the current command.
@@ -143,6 +193,15 @@ class HCQGraph(MultiGraphRunner):
         self.prof_graph_deps.append([d - 1 for _, d in rdeps])
 
       self.last_j[enqueue_queue] = j
+
+    # Work out, per queue, which dispatches still need their wave drain. A queue is only eligible if every item on it is a plain
+    # dispatch: a drain can only be attached to an exec, so a queue carrying RDMA doorbell rings has spots with nowhere to put one.
+    # Queues that end up with no entry here are encoded exactly as before, which is also what happens with the env var off.
+    self.ji_flush: dict[int, bool] = {}
+    if AMD_ELIDE_FLUSH:
+      self.ji_flush = flush_elision_plan(self.q_items, self.q_rdeps, {peer_q for peer_q, _, _, _ in self.rdma_deps.values()})
+      if DEBUG >= 2 and len(self.ji_flush) > 0:
+        print(f"HCQGraph: flush elision keeps {sum(self.ji_flush.values())} of {len(self.ji_flush)} inter-dispatch wave drains")
 
     # Check which signals are used in the profile graph.
     self.prof_signal_is_used: set[int] = {sid for ent in self.prof_graph_entries for sid in (ent.st_id, ent.en_id)}
@@ -172,7 +231,10 @@ class HCQGraph(MultiGraphRunner):
 
       # Encode main commands based on ji type.
       if runtime is not None:
-        enqueue_queue.exec(runtime, self.ji_args[j], ast.arg.global_size or (1,1,1), ast.arg.local_size or (1,1,1))
+        gsize, lsize = ast.arg.global_size or (1,1,1), ast.arg.local_size or (1,1,1)
+        # Only queues that opted in are passed the keyword; every other backend keeps its own exec signature and its own behaviour.
+        if (do_flush:=self.ji_flush.get(j)) is None: enqueue_queue.exec(runtime, self.ji_args[j], gsize, lsize)
+        else: cast(Any, enqueue_queue).exec(runtime, self.ji_args[j], gsize, lsize, flush=do_flush)
       elif j in self.rdma_deps:
         dest_queue, dest_deps, dest_out_signal, dest_out_val = self.rdma_deps[j]
         for sig, val in dest_deps: dest_queue.wait(sig, val)

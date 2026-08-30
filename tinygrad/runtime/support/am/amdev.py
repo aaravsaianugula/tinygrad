@@ -21,6 +21,125 @@ class AMRegister(AMDReg):
 
   def update(self, inst=0, **kwargs): self.write(self.read(inst=inst) & ~self.fields_mask(*kwargs.keys()), inst=inst, **kwargs)
 
+# The board-specific tail of PPTable_t -- I2cControllers through BoardReserved -- ships ZEROED in
+# AMD's SMU firmware and is filled by the driver from the card's own VBIOS
+# (sienna_cichlid_append_powerplay_table). Without it the SMU has no voltage-regulator mapping, and
+# on a part whose GFXCLK is driven by a DFLL rather than a PLL the clock follows the voltage the VR
+# supplies -- so the SMU accepts every SetSoftMinByFreq and cannot act on one. Measured on a Navi 23:
+# gfxclk pinned at GfxclkFidle, 497 MHz of an available 2350, AverageSocketPower reporting 2 W
+# because the current telemetry is uncalibrated for the same reason.
+SMC_DPM_INFO_INDEX = 2                      # 0-based index in atom_master_list_of_data_tables_v2_1
+SMC_DPM_INFO_V4_9 = (296, 4, 9)             # structuresize, format_revision, content_revision
+SMC_DPM_INFO_BOARD_OFF = 4                  # offsetof(atom_smc_dpm_info_v4_9, I2cControllers)
+PPTABLE_BOARD_OFF, PPTABLE_BOARD_LEN = 1344, 292   # PPTable_t I2cControllers .. end of BoardReserved
+
+# ROM_INDEX / ROM_DATA within the SMUIO block, in dwords. smuio_11_0_6_offset.h shifts these one
+# dword up from smuio_11_0_0_offset.h, and amdgpu picks between the two by SMUIO IP version
+# (amdgpu_discovery.c:3575-3592). A Navi 23 reports SMUIO 11.0.10 and therefore takes the *_6 map;
+# using the other one would write the ROM index into CGTT_ROM_CLK_CTRL0 -- the ROM clock-gating
+# control -- on a live card. Only the versions the kernel names are listed, because an unknown
+# SMUIO here has to be a refusal rather than a guess.
+SMUIO_ROM_REGS: dict[tuple[int, ...], tuple[int, int]] = {
+  **{v: (0xe4, 0xe5) for v in ((11,0,0), (11,0,2), (11,0,3), (11,0,4), (11,0,7), (11,0,8))},
+  **{v: (0xe5, 0xe6) for v in ((11,0,6), (11,0,10), (11,0,11), (11,5,0), (11,5,2),
+                               (13,0,1), (13,0,9), (13,0,10))},
+}
+
+def vbios_reader(adev):
+  """A `read(offset, nbytes)` over the card's VBIOS, through SMUIO's ROM_INDEX/ROM_DATA window.
+
+  amdgpu_soc15_read_bios_from_rom: write a byte offset to ROM_INDEX once, then read ROM_DATA
+  repeatedly and the index auto-increments four bytes per dword. nbio_v2_3 has no get_rom_offset,
+  so the base offset is zero. Reads only -- the index register is the single write, and nothing
+  needs restoring afterwards.
+
+  Before writing anything it identifies the pair without writing: reading ROM_DATA advances
+  ROM_INDEX, so N reads must move the index by exactly 4N. If the register map were wrong that
+  check fails and nothing has been written yet.
+  """
+  # RuntimeError rather than KeyError throughout: the caller degrades on RuntimeError, and a card
+  # whose discovery table has no SMUIO block must lose its clocks, not fail to open at all.
+  if am.SMUIO_HWIP not in adev.ip_ver or am.SMUIO_HWIP not in adev.regs_offset:
+    raise RuntimeError("this card's discovery table has no SMUIO block, so there is no ROM window")
+  if (ver:=tuple(adev.ip_ver[am.SMUIO_HWIP])) not in SMUIO_ROM_REGS:
+    raise RuntimeError(f"no known ROM_INDEX/ROM_DATA map for SMUIO {'.'.join(map(str, ver))}")
+  base = adev.regs_offset[am.SMUIO_HWIP][0][0]
+  rom_index, rom_data = (base + off for off in SMUIO_ROM_REGS[ver])
+
+  # Identify the window before writing to it, by reading only. Watching ROM_INDEX for the +4 the
+  # kernel's loop relies on does not work here: on this part the index register reads back
+  # unchanged while ROM_DATA streams. What does hold is that ROM_DATA is a moving window -- four
+  # reads of a ROM return four different dwords, where any ordinary register returns one value
+  # four times. If that fails we have the wrong pair and nothing has been written yet.
+  if len(set(probe:=[adev.rreg(rom_data) for _ in range(4)])) == 1:
+    raise RuntimeError(f"SMUIO {'.'.join(map(str, ver))} ROM window at {rom_index:#x}/{rom_data:#x} is not "
+                       + f"streaming: four reads all returned {probe[0]:#x}. Not writing to it.")
+
+  def read(off:int, n:int) -> bytes:
+    # Seek to the containing dword and trim, so callers can ask for any byte range.
+    adev.wreg(rom_index, start:=off & ~3)
+    data = b''.join(adev.rreg(rom_data).to_bytes(4, 'little') for _ in range((off - start + n + 3) // 4))
+    return data[off - start:off - start + n]
+  return read
+
+def atom_board_data(read) -> bytes:
+  """The 292 board bytes for PPTable_t, walked out of a VBIOS through `read(offset, nbytes)`.
+
+  Takes a reader rather than an image because on a USB-attached card every MMIO access is a round
+  trip: pulling the whole 64 KiB to reach four small tables would add thousands of them to every
+  device open. Every pointer in the ATOM chain is a u16, so the walk only ever seeks within the
+  first 64 KiB, and this touches about a hundred dwords instead of sixteen thousand.
+
+  The traversal is amdgpu_atom_parse_data_header's: the ROM header pointer at 0x48, its data-table
+  pointer at +0x20, then entry SMC_DPM_INFO_INDEX of the master list, which sits after that
+  table's own 4-byte common header. Every offset is relative to byte 0 of the image, never to its
+  parent.
+
+  Raises ValueError naming the specific check that failed. Nothing here may fall back to a
+  plausible answer: these bytes are blitted over the voltage-regulator mapping and the current
+  telemetry calibration, so a wrong 292 bytes is worse than none.
+  """
+  def rd(off:int, n:int) -> bytes:
+    if len(b:=bytes(read(off, n))) != n: raise ValueError(f"VBIOS read at {off:#x} wanted {n} bytes, got {len(b)}")
+    return b
+  def u16(off:int) -> int: return int.from_bytes(rd(off, 2), 'little')
+
+  if (sig:=rd(0, 2)) != bytes((0x55, 0xAA)): raise ValueError(f"not a PCI option ROM: starts {sig.hex()}, want 55aa")
+  # atom.c compares 10 bytes and the leading space is part of the string. amdgpu_bios.c's
+  # AMD_VBIOS_SIGNATURE_SIZE is a sizeof() and counts the NUL, which is why the two disagree by one.
+  if (ati:=rd(0x30, 10)) != b" 761295520": raise ValueError(f"missing ATI signature at 0x30: {ati!r}")
+  if not (base:=u16(0x48)): raise ValueError("ROM header pointer at 0x48 is zero")
+  if (magic:=rd(base + 4, 4)) == b"MOTA":
+    # A genuinely byte-swapped image is not a thing on a PCIe card. Far likelier the read path
+    # transposed u16s, and a swapping parser would paper over a broken read.
+    raise ValueError("ATOM magic reads 'MOTA': the ROM read is byte-swapping u16s, fix the read")
+  if magic != b"ATOM": raise ValueError(f"no ATOM magic at ROM header + 4: {magic!r}")
+  if not (data_table:=u16(base + 0x20)): raise ValueError("master data table pointer is zero")
+  # +4 skips the master table's own atom_common_table_header. get_index_into_master_table
+  # deliberately excludes it -- it offsets into the inner list -- so it is added exactly here.
+  if not (smc:=u16(data_table + 4 + SMC_DPM_INFO_INDEX * 2)):
+    raise ValueError("this VBIOS carries no smc_dpm_info table")
+
+  hdr = rd(smc, 4)
+  size, frev, crev = int.from_bytes(hdr[:2], 'little'), hdr[2], hdr[3]
+  if (size, frev, crev) != SMC_DPM_INFO_V4_9:
+    # atom_smc_dpm_info_v4_10 has a different shape entirely -- no I2cControllers at the front --
+    # so reading it as v4_9 would silently produce garbage rather than fail.
+    raise ValueError(f"smc_dpm_info is {size} bytes rev {frev}.{crev}, want {SMC_DPM_INFO_V4_9[0]} "
+                     + f"rev {SMC_DPM_INFO_V4_9[1]}.{SMC_DPM_INFO_V4_9[2]}; refusing to read it as v4_9")
+  board = rd(smc + SMC_DPM_INFO_BOARD_OFF, size - SMC_DPM_INFO_BOARD_OFF)
+  if len(board) != PPTABLE_BOARD_LEN: raise ValueError(f"board span {len(board)} != {PPTABLE_BOARD_LEN}")
+  # Sanity, so a table of zeros cannot be blitted in and look like the fix landed. Checked on
+  # GfxMaxCurrent -- the current-telemetry slope, whose absence is precisely what stops PPT and TDC
+  # asserting -- and on the memory channel mask. Deliberately NOT on VddGfxVrMapping: that is a
+  # small rail index and zero is legitimate, as this card shows (gfx 0, soc 2, mem0 1, mem1 3).
+  gfx_max_current = int.from_bytes(board[144 - SMC_DPM_INFO_BOARD_OFF:146 - SMC_DPM_INFO_BOARD_OFF], 'little')
+  channels = int.from_bytes(board[196 - SMC_DPM_INFO_BOARD_OFF:200 - SMC_DPM_INFO_BOARD_OFF], 'little')
+  if not gfx_max_current or not channels:
+    raise ValueError(f"VBIOS board data reads empty (GfxMaxCurrent={gfx_max_current}, "
+                     + f"MemoryChannelEnabled={channels:#x}); this table is not the missing data")
+  return board
+
 class AMFirmware:
   # linux-firmware ships Navi 2x discrete parts under AMD's codenames, not under the discovery IP
   # version AM builds names from, so psp_11_0_12_sos.bin and friends simply do not exist there.
@@ -73,6 +192,9 @@ class AMFirmware:
     # Load other fw
     self.ucode_start: dict[str, int] = {}
     self.descs: list[tuple[list[int], memoryview]] = []
+    # The SMU 11 pptable, when this part ships one. None everywhere else, and AM_SMU treats
+    # None as "this SMU does not need a table", which is true of 13 and 14.
+    self.smu_pptable: bytes|None = None
 
     # SMU firmware
     if adev.ip_ver[am.MP1_HWIP] != (13,0,12):
@@ -83,6 +205,21 @@ class AMFirmware:
       # AttributeError. MI300 is GC 9.4.3, so >= (10,0,0) is the split that separates the two.
       if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0):
         self.smu_psp_desc = self.desc(blob, hdr.v1_0.header.ucode_array_offset_bytes, hdr.v1_0.header.ucode_size_bytes, am.GFX_FW_TYPE_SMU)
+        # SMU 11 will not release its DPM tables until the driver uploads a pptable, and the
+        # blob carries one. The region ppt_offset_bytes points at is not a bare PPTable_t: it is
+        # a `struct smu_11_0_7_powerplay_table` wrapper whose own table_size field is documented
+        # as "the offset to smc_pptable including header size", so the firmware states where its
+        # inner table begins rather than this having to encode a packed struct layout. On a Navi
+        # 23 that reads 802 -- which is what summing the header, power_saving_clock_table and
+        # overdrive_table gives -- and 802 + sizeof(PPTable_t) = 802 + 1668 is exactly the
+        # 2470-byte region. SMU 13/14 boot with a usable soft pptable already loaded and need
+        # none of this, so it is not extracted for them.
+        if adev.ip_ver[am.MP1_HWIP][0] == 11 and hasattr(hdr, 'ppt_offset_bytes'):
+          wrapper = bytes(blob[hdr.ppt_offset_bytes:hdr.ppt_offset_bytes + hdr.ppt_size_bytes])
+          inner_off = int.from_bytes(wrapper[5:7], 'little')
+          if 0 < inner_off < len(wrapper): self.smu_pptable = wrapper[inner_off:]
+          else: print(f"am {adev.devfmt}: smc pptable header says smc_pptable starts at {inner_off}"
+                      f" of {len(wrapper)} bytes; not uploading a table this driver cannot locate")
       else:
         p2stables = (am.struct_smc_soft_pptable_entry * hdr.pptable_count).from_buffer(blob[hdr.pptable_entry_offset:])
         for p2stable in p2stables:
@@ -249,13 +386,29 @@ class AMDev:
     # out loud, because a card silently stuck at boot clocks is its own kind of wrong answer.
     # Only SMUError is caught: that is the SMU answering "no", which is a fact about the card.
     # A timeout still propagates, because that is the SMU not answering at all.
-    try:
-      if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
-        self.smu.set_power_limit(max_power)
-        self.smu.set_clocks(level=None)
-      else: self.smu.set_clocks(level=-1) # last level, max perf.
+    if (max_power:=getenv("AM_POWER_LIMIT", 0.0)) > 0:
+      # A refused power limit must not skip the clocks. They are independent requests, and the
+      # card is more use pinned-and-uncapped than capped-and-idle.
+      try: self.smu.set_power_limit(max_power)
+      except SMUError as e: print(f"am {self.devfmt}: the SMU refused a {max_power:.0f}W power limit: {e}")
+      level = None
+    else: level = -1 # last level, max perf.
+    try: took = self.smu.set_clocks(level=level)
     except SMUError as e:
+      took = {}
       print(f"am {self.devfmt}: running at the SMU's default clocks, it refused to set them: {e}")
+    # Which domains answered is the whole point: a card that took GFXCLK and refused UCLK performs
+    # nothing like one that refused both, and both used to print the same single line.
+    #
+    # "accepted", not "pinned", and the difference is not pedantry. A Sienna Cichlid whose pptable
+    # still has its board section zeroed accepts every SetSoftMin/MaxByFreq and then does not move
+    # -- measured at gfxclk 497 of an available 2350 MHz with all four domains reporting success.
+    # Claiming the clocks are pinned is how a card silently stuck at boot clocks reads as healthy,
+    # which is the exact failure this reporting exists to prevent.
+    if (refused:=[k for k,v in took.items() if not v]):
+      ok = ", ".join(k for k,v in took.items() if v)
+      print(f"am {self.devfmt}: the SMU refused {', '.join(refused)}; accepted {ok or 'nothing'}")
+    elif took and DEBUG >= 2: print(f"am {self.devfmt}: clock request accepted for {', '.join(took)}")
     for ip in [self.soc, self.gfx]: ip.set_clockgating_state()
     self.reg("regSCRATCH_REG7").write(AMDev.Version)
     self.reg("regSCRATCH_REG6").write(1) # set initialized state.
@@ -330,12 +483,23 @@ class AMDev:
     self.reg(f"{reg_base}{lo_suffix}").write(lo32(val), inst=inst)
     self.reg(f"{reg_base}{hi_suffix}").write(hi32(val), inst=inst)
 
+  def _rsmu(self, reg:int) -> AMRegister:
+    # Not every ASIC has an RSMU window. nbio 2.3 (Navi 2x) has no regBIF_BX_PF0_RSMU_* at all --
+    # not merely missing from tinygrad's table, absent from the register set -- so an out-of-
+    # aperture access here cannot be served. Say that, instead of surfacing as a bare KeyError
+    # from __dict__ several frames away from the register that was actually out of range.
+    if "regBIF_BX_PF0_RSMU_INDEX" not in self.__dict__:
+      nbio = '.'.join(map(str, self.ip_ver.get(am.NBIO_HWIP, ()))) or "unknown"
+      raise RuntimeError(f"register {reg:#x} is outside the {len(self.mmio):#x}-dword MMIO aperture and "
+                         f"this ASIC has no RSMU window to reach it through (nbio {nbio})")
+    return self.reg("regBIF_BX_PF0_RSMU_INDEX")
+
   def indirect_rreg(self, reg:int) -> int:
-    self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
+    self._rsmu(reg).write(reg * 4)
     return self.reg("regBIF_BX_PF0_RSMU_DATA").read()
 
   def indirect_wreg(self, reg:int, val:int):
-    self.reg("regBIF_BX_PF0_RSMU_INDEX").write(reg * 4)
+    self._rsmu(reg).write(reg * 4)
     self.reg("regBIF_BX_PF0_RSMU_DATA").write(val)
 
   def indirect_wreg_pcie(self, reg:int, val:int, aid:int=0):

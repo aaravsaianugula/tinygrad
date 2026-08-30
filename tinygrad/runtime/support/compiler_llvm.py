@@ -84,7 +84,13 @@ class AMDLLVMCompiler(LLVMCompiler):
   jit = False
   def __init__(self, arch: str):
     self.arch = arch
-    super().__init__("AMDGPU", self.arch, "+cumode")
+    # +cumode confines a workgroup to one CU (2 SIMDs) instead of a WGP (4 SIMDs) and halves the
+    # LDS a workgroup can address. LLVM's own default is the opposite -- absent the feature, gfx10+
+    # compiles for WGP mode -- and nothing here documents why tinygrad overrides it. rsrc1 comes
+    # straight from the compiled kernel descriptor (ops_amd.py AMDProgram), so the dispatch follows
+    # whatever was compiled and no driver change is needed to try the other one. The feature string
+    # is part of the disk-cache key, so the two modes cannot contaminate each other's results.
+    super().__init__("AMDGPU", self.arch, "" if getenv("AMD_WGP_MODE", 0) else "+cumode")
   def __reduce__(self): return (AMDLLVMCompiler, (self.arch,))
   def compile(self, src:str) -> bytes:
     try: return super().compile(src)

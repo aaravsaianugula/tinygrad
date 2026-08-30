@@ -77,6 +77,10 @@ class HWQueue(Generic[SignalType, HCQDeviceType, ProgramType, ArgsStateType]):
   A base class for hardware command queues in the HCQ (Hardware Command Queue) API.
   """
 
+  # Set by queue types whose `exec` accepts a `flush` keyword, i.e. types that let the caller take over ordering dispatches
+  # against each other. Off by default so a backend that has not opted in keeps its own `exec` signature untouched.
+  supports_flush_elision: bool = False
+
   def __init__(self):
     self._q:Any = []
     self.binded_device:HCQDeviceType|None = None

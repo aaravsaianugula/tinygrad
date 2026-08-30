@@ -45,6 +45,11 @@ GFX_TARGET_VERSION = {
 }
 
 EVENT_INDEX_PARTIAL_FLUSH = 4 # based on a comment in nvd.h
+
+# Batch the compute ring write into one transaction per contiguous run. Off by default: the
+# same change was reverted once after a single ambiguous hang, so it ships behind a switch
+# until it has survived a soak on this link. See AMDComputeQueue._submit.
+AMD_BATCH_RING = getenv("AMD_BATCH_RING", 0)
 WAIT_REG_MEM_FUNCTION_EQ  = 3 # ==
 WAIT_REG_MEM_FUNCTION_NEQ = 4 # !=
 WAIT_REG_MEM_FUNCTION_GEQ = 5 # >=
@@ -68,6 +73,8 @@ class AMDSignal(HCQSignal):
     if time_spent_since_last_sleep_ms > 200 and self.owner is not None: self.owner.iface.sleep(200)
 
 class AMDComputeQueue(HWQueue):
+  supports_flush_elision: bool = True
+
   def __init__(self, dev:AMDDevice):
     self.dev, self.soc, self.pm4, self.gc, self.nbio = dev, dev.soc, dev.pm4, dev.gc, dev.nbio
     super().__init__()
@@ -336,9 +343,13 @@ class AMDComputeQueue(HWQueue):
     self.memory_barrier()
     return self
 
-  def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
+  def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...], flush:bool=True):
     self.bind_args_state(args_state)
 
+    # NOTE: this invalidate is what makes a *dependent* dispatch see its producer's writes, so it stays unconditional even when
+    # the wave drain below is elided: the drain retires the producer's waves down to GL2, this pulls the stale copies out of the
+    # consumer's GL0/GL1/K$. Between independent dispatches it is pure overhead, but gating it needs the same analysis and it is
+    # orders of magnitude cheaper than a drain, so it is not worth the risk.
     self.acquire_mem(gli=0, gl2=0)
 
     user_regs = []
@@ -383,7 +394,17 @@ class AMDComputeQueue(HWQueue):
                                                            force_start_at_000=1, compute_shader_en=1))
 
     if prg.dev.sqtt_enabled: self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.THREAD_TRACE_MARKER) | self.pm4.EVENT_INDEX(0))
-    self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.CS_PARTIAL_FLUSH) | self.pm4.EVENT_INDEX(EVENT_INDEX_PARTIAL_FLUSH))
+
+    # CS_PARTIAL_FLUSH drains every wave outstanding on the device, which is why one of them covers every dispatch encoded before
+    # it -- and why paying for one per dispatch means no two kernels ever overlap and each one eats a wave-drain tail at near zero
+    # occupancy. It is only needed when something after it has to observe this dispatch's writes. It is not needed to protect the
+    # dispatch itself: the CP does not retire DISPATCH_DIRECT until every workgroup has been handed to the SPI, and a launched wave
+    # carries its own latched PGM/RSRC/USER_DATA/TMPRING state, so a following dispatch's register writes cannot reach back into it.
+    # Signals and timestamps do not need it either, they are RELEASE_MEM end-of-pipe and drain the pipe themselves. So the caller
+    # may pass flush=False when it knows no later command on this queue depends on this dispatch (HCQGraph does exactly that);
+    # everyone else keeps the default and the fully serialised behaviour. SQTT attributes traced waves per dispatch, so it opts out.
+    if flush or prg.dev.sqtt_enabled:
+      self.pkt3(self.pm4.PACKET3_EVENT_WRITE, self.pm4.EVENT_TYPE(self.soc.CS_PARTIAL_FLUSH) | self.pm4.EVENT_INDEX(EVENT_INDEX_PARTIAL_FLUSH))
     return self
 
   def wait(self, signal:AMDSignal, value:sint=0): return self.wait_reg_mem(mem=signal.value_addr, value=value, mask=0xffffffff)
@@ -433,13 +454,38 @@ class AMDComputeQueue(HWQueue):
       cmds = [self.pm4.PACKET3(self.pm4.PACKET3_INDIRECT_BUFFER, 2), *data64_le(ib_ptr), len(cmds) | self.pm4.INDIRECT_BUFFER_VALID,
               self.pm4.PACKET3(self.pm4.PACKET3_NOP, ib_pad + len(cmds) - 1), *((0,) * ib_pad), *cmds]
 
-    for i, value in enumerate(cmds): dev.compute_queue.ring[(dev.compute_queue.put_value + i) % len(dev.compute_queue.ring)] = value
+    # Write the ring in as few transactions as the wraparound allows.
+    #
+    # Over USB every one of these element assignments is its own pcie_mem_write, which is a control
+    # transfer plus a bulk transfer -- and measured on this link a transaction costs ~0.24 ms whether
+    # it carries 4 bytes or 218. A slice assignment is the same two transactions for the whole range,
+    # so a bound graph's 4-dword INDIRECT_BUFFER packet goes from 8 transactions to 2. AMDCopyQueue
+    # already submits this way; the compute queue was simply inconsistent with it.
+    #
+    # Behind a flag because the identical change was implemented and reverted once before, after a
+    # single hang whose signature ("signal is not set to N, but N-1") has also occurred on this rig
+    # WITHOUT it -- so the evidence was ambiguous and the only way to settle it is to be able to turn
+    # it off. If a hang appears, bisect: bind() writes the whole captured buffer element-wise too,
+    # and _submit demonstrably survived 13 replays on its own.
+    ring, put, n = dev.compute_queue.ring, dev.compute_queue.put_value, len(dev.compute_queue.ring)
+    if AMD_BATCH_RING and not isinstance(cmds, MMIOInterface):
+      start = put % n
+      head = min(len(cmds), n - start)
+      ring[start:start + head] = array.array('I', cmds[:head])
+      if head < len(cmds): ring[0:len(cmds) - head] = array.array('I', cmds[head:])
+    else:
+      for i, value in enumerate(cmds): ring[(put + i) % n] = value
 
     dev.compute_queue.put_value += len(cmds)
     dev.compute_queue.signal_doorbell(dev)
 
 class AMDComputeAQLQueue(AMDComputeQueue):
-  def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...]):
+  # AQL never emitted a CS_PARTIAL_FLUSH in the first place: ordering here comes from the barrier bit in AQL_HDR, which the packet
+  # builder below sets on every dispatch. There is nothing for a caller to elide, so `flush` is accepted (the override has to stay
+  # compatible with AMDComputeQueue) and ignored, and the graph is told not to bother computing it.
+  supports_flush_elision: bool = False
+
+  def exec(self, prg:AMDProgram, args_state:CLikeArgsState, global_size:tuple[sint, ...], local_size:tuple[sint, ...], flush:bool=True):
     self.bind_args_state(args_state)
     if prg.dev.sqtt_enabled: self.sqtt_setup_exec(prg, global_size)
     self._q.append(pkt:=hsa.hsa_kernel_dispatch_packet_t(header=AQL_HDR | (hsa.HSA_PACKET_TYPE_KERNEL_DISPATCH << hsa.HSA_PACKET_HEADER_TYPE),

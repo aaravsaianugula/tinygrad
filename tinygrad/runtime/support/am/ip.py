@@ -22,7 +22,15 @@ class AM_SOC(AM_IP):
     self.sdma_ih_clients = [] if ih_soc21 else [getattr(am, f'SOC15_IH_CLIENTID_SDMA{i}') for i in range(8)]
 
     def _ih_srcs(pref:str, hwip:int) -> dict[int, str]:
-      return {getattr(am, k): k[off+9:] for k in dir(am) if k.startswith(f'{pref}_{self.adev.ip_ver[hwip][0]}') and (off:=k.find('__SRCID__')) != -1}
+      gen = self.adev.ip_ver[hwip][0]
+      # The autogen SRCID tables cover GFX 9, 11 and 12 but not 10, so on RDNA1/RDNA2 every GFX
+      # interrupt resolved to '' -- which is not in the benign set in interrupt_handler, so an
+      # ordinary end-of-pipe interrupt set is_err_state and made a healthy device look hung.
+      # gfx10's source IDs are the same SOC15 numbers as gfx9: checked against the kernel's
+      # ivsrcid/gfx/irqsrcs_gfx_10_1.h, all 24 constants tinygrad carries have identical values,
+      # and gfx10 adds only CP_GENERIC_INT=177, which aliases CP_IB1_INTERRUPT_PKT.
+      if pref == 'GFX' and gen == 10: gen = 9
+      return {getattr(am, k): k[off+9:] for k in dir(am) if k.startswith(f'{pref}_{gen}') and (off:=k.find('__SRCID__')) != -1}
 
     gfx_srcs, sdma_srcs = _ih_srcs('GFX', am.GC_HWIP), _ih_srcs('SDMA0', am.SDMA0_HWIP)
     self.ih_srcs_names:dict[int, dict[int, str]] = {**{k: gfx_srcs for k in self.gfx_ih_clients}, **{k: sdma_srcs for k in self.sdma_ih_clients}}
@@ -100,7 +108,14 @@ class AM_GMC(AM_IP):
 
   def init_hw(self): self.init_hub("MM", inst_cnt=self.vmhubs)
 
-  def flush_hdp(self): self.adev.wreg(self.adev.reg("regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL").read() // 4, 0x0)
+  def flush_hdp(self):
+    # Only bits 2..18 of this register are the remapped flush address (the autogen table gives the
+    # field as 'address': (2, 18)); the rest is not part of it. Taking the whole dword and dividing
+    # by four happens to be right when the upper bits read back zero, and on Navi 23 they do not --
+    # the index then lands outside the mapped MMIO aperture, AMDev.rreg falls through to the
+    # indirect RSMU window, and nbio 2.3 has no regBIF_BX_PF0_RSMU_INDEX, so this raises KeyError.
+    # That is what made a hung kernel unrecoverable here: flush_hdp is on the recover() path.
+    self.adev.wreg(self.adev.reg("regBIF_BX0_REMAP_HDP_MEM_FLUSH_CNTL").read_bitfields()["address"], 0x0)
   def flush_tlb(self, ip:Literal["MM", "GC"], vmid, flush_type=0):
     self.flush_hdp()
 
@@ -197,10 +212,122 @@ class AM_SMU(AM_IP):
     self.smu_mod = self.adev._ip_module("smu", am.MP1_HWIP)
     self.driver_table_paddr = self.adev.mm.palloc(0x4000, zero=False, boot=True)
 
+  # smu11_driver_if_sienna_cichlid.h bits that power-gate or deep-sleep a block AM drives.
+  # amdgpu enables these because it implements the handshakes that bring the block back
+  # (smu_v11_0_gfx_off_control and friends). AM has none, so an engine that powers itself down
+  # between submissions never comes back and the next one hangs -- observed on a Navi 23, where
+  # enabling the pptable's own FeaturesToRun verbatim wedged the GFX ring on the first kernel
+  # after boot, and clearing these ran it.
+  SMU11_UNSERVICEABLE_FEATURES = {12: "DS_GFXCLK", 18: "GFX_ULV", 20: "GFXOFF", 22: "MM_DPM_PG",
+                                  34: "GFX_DCS", 40: "MMHUB_PG", 41: "ATHUB_PG"}
+
+  def _setup_pptable(self):
+    """Hand SMU 11 its pptable. Without it there are no DPM tables and the card stays at boot clocks.
+
+    SMU 13 and 14 come up with a usable soft pptable already loaded, which is why AM never needed
+    this. SMU 11 does not: every GetDpmFreqByIndex and every SetSoftMaxByFreq answers CMD_FAIL,
+    set_clocks pins nothing, and a Navi 23 sits at 500 MHz against a 2350 MHz top DPM entry.
+
+    amdgpu's order, from smu_smc_hw_setup: upload the table, run BTC, set the allowed feature
+    mask, then enable features. BTC is the AVFS voltage calibration -- boosting without it is
+    how you get a card that runs for one kernel.
+    """
+    if (ppt:=self.adev.fw.smu_pptable) is None: return
+    try: self._upload_pptable(ppt)
+    except SMUError as e:
+      # Same call the clocks make: this is a performance step, not a correctness one. A card
+      # whose SMU declines the table still executes kernels, it just will not leave boot clocks,
+      # and refusing to build the device over that is worse than running slow. A TimeoutError
+      # still propagates -- that is the SMU not answering at all, which is not about the table.
+      print(f"am {self.adev.devfmt}: the SMU refused its pptable, so there will be no DPM: {e}")
+
+  def _patch_board_data(self, ppt:bytes) -> bytes:
+    """Fill PPTable_t's board section from the card's own VBIOS, as amdgpu does before upload.
+
+    AMD ships I2cControllers..BoardReserved zeroed in the SMU firmware and expects the driver to
+    supply it (sienna_cichlid_append_powerplay_table). It carries the voltage-regulator mapping
+    and the current-telemetry calibration, so without it the SMU cannot command a rail: on a part
+    whose GFXCLK is a DFLL the clock follows the voltage the VR supplies, and the SMU ends up
+    accepting every SetSoftMinByFreq while sitting at GfxclkFidle.
+
+    A failure here is reported and survived, not raised. Uploading the table with its board
+    section still zeroed is exactly today's behaviour -- DPM tables exist, clocks do not rise --
+    and that is strictly better than no table at all.
+    """
+    from tinygrad.runtime.support.am.amdev import PPTABLE_BOARD_LEN, PPTABLE_BOARD_OFF, atom_board_data, vbios_reader
+    try: board = atom_board_data(vbios_reader(self.adev))
+    except (ValueError, RuntimeError) as e:
+      print(f"am {self.adev.devfmt}: no board data from the VBIOS, so the SMU will have no voltage-regulator "
+            + f"mapping and the clocks will stay at boot: {e}")
+      return ppt
+    if DEBUG >= 2: print(f"am {self.adev.devfmt}: patched {len(board)} bytes of VBIOS board data into the pptable")
+    return ppt[:PPTABLE_BOARD_OFF] + board + ppt[PPTABLE_BOARD_OFF + PPTABLE_BOARD_LEN:]
+
+  def _upload_pptable(self, ppt:bytes):
+    ppt = self._patch_board_data(ppt)
+    # The USB bridge issues PCIe memory writes as whole dwords, so the payload has to be dword
+    # sized. sizeof(PPTable_t) already is; padding costs nothing and does not assume that.
+    padded = pad_bytes(ppt, 4)
+    self.adev.vram.view(self.driver_table_paddr, len(padded))[:] = memoryview(padded)
+    self._send_msg(self.smu_mod.PPSMC_MSG_TransferTableDram2Smu, self.smu_mod.TABLE_PPTABLE)
+    self._send_msg(self.smu_mod.PPSMC_MSG_RunDcBtc, 0, timeout=30000)
+
+    # PPTable_t is {uint32 Version; uint32 FeaturesToRun[2]; ...} -- the firmware's own answer for
+    # which features this part should run. Start there rather than from all-ones, then drop what
+    # this driver cannot service.
+    feat = int.from_bytes(ppt[4:12], 'little')
+    unserviceable = sum(1 << b for b in self.SMU11_UNSERVICEABLE_FEATURES)
+    if DEBUG >= 2 and (dropped:=feat & unserviceable):
+      names = ', '.join(n for b, n in self.SMU11_UNSERVICEABLE_FEATURES.items() if dropped >> b & 1)
+      print(f"am {self.adev.devfmt}: not enabling {names}: no handshake to wake a gated block")
+    feat &= ~unserviceable
+    # High before Low, which is smu_v11_0_set_allowed_mask's order across every SMU generation.
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetAllowedFeaturesMaskHigh, (feat >> 32) & 0xffffffff)
+    self._send_msg(self.smu_mod.PPSMC_MSG_SetAllowedFeaturesMaskLow, feat & 0xffffffff)
+    self.requested_features = feat
+
   def init_hw(self):
     self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrHigh, hi32(self.adev.paddr2mc(self.driver_table_paddr)))
     self._send_msg(self.smu_mod.PPSMC_MSG_SetDriverDramAddrLow, lo32(self.adev.paddr2mc(self.driver_table_paddr)))
-    self._send_msg(self.smu_mod.PPSMC_MSG_EnableAllSmuFeatures, 0)
+    self.requested_features = 0
+    self._setup_pptable()
+    self._send_msg(self.smu_mod.PPSMC_MSG_EnableAllSmuFeatures, 0, timeout=30000)
+    # "Explicitly notify PMFW the power mode the system in. Since the PMFW may boot the ASIC with
+    # a different mode" -- smu_late_init. amdgpu sends this whenever the ACDC feature is not
+    # GPIO-controlled, which is every plain dGPU, and a card that booted believing DC applies a
+    # different set of limits. Suppressed rather than raised: it is a hint, not a dependency.
+    # Only on the pptable path. amdgpu sends this on every ASIC, but SMU 13/14 work today and are
+    # what comma ships, so they keep their existing message sequence byte for byte.
+    if self.requested_features and hasattr(self.smu_mod, 'PPSMC_MSG_NotifyPowerSource'):
+      with contextlib.suppress(TimeoutError, SMUError):
+        self._send_msg(self.smu_mod.PPSMC_MSG_NotifyPowerSource, self.smu_mod.SMU_POWER_SOURCE_AC)
+    self._check_running_features()
+
+  # Features whose absence means a clock request will be silently ignored. smu_cmn_clk_dpm_is_enabled
+  # maps each clock domain to one of these, and smu_v11_0_set_soft_freq_limited_range returns 0
+  # without sending anything when its bit is not running -- because the SMU ACKs the message and
+  # does nothing. If one of these is requested and not running, say so by name.
+  DPM_CLOCK_FEATURES = {1: "DPM_GFXCLK", 3: "DPM_UCLK", 4: "DPM_FCLK", 5: "DPM_SOCCLK"}
+
+  def _check_running_features(self):
+    """Close the loop: ask which features are actually running, not which we asked for.
+
+    Every smu_cmn_feature_is_enabled() in amdgpu reads this read-back list rather than the
+    requested mask, and smu_smc_hw_setup calls it immediately after enabling. Without it a card
+    that accepted the mask and started nothing looks identical to one that worked.
+    """
+    if not self.requested_features or not hasattr(self.smu_mod, 'PPSMC_MSG_GetRunningSmuFeaturesLow'): return
+    try:
+      lo = self._send_msg(self.smu_mod.PPSMC_MSG_GetRunningSmuFeaturesLow, 0, read_back_arg=True, timeout=5000)
+      hi = self._send_msg(self.smu_mod.PPSMC_MSG_GetRunningSmuFeaturesHigh, 0, read_back_arg=True, timeout=5000)
+    except (SMUError, TimeoutError) as e:
+      print(f"am {self.adev.devfmt}: could not read back the running feature mask: {e}")
+      return
+    self.running_features = running = ((hi & 0xffffffff) << 32) | (lo & 0xffffffff)
+    if (missing:=[n for b, n in self.DPM_CLOCK_FEATURES.items() if self.requested_features >> b & 1 and not running >> b & 1]):
+      print(f"am {self.adev.devfmt}: the SMU did not start {', '.join(missing)}; clock requests for those "
+            + "domains will be accepted and ignored")
+    elif DEBUG >= 2: print(f"am {self.adev.devfmt}: running features {running:#018x}")
 
   def is_smu_alive(self):
     with contextlib.suppress(TimeoutError, SMUError): self._send_msg(self.smu_mod.PPSMC_MSG_GetSmuVersion, 0, timeout=100)
@@ -220,25 +347,166 @@ class AM_SMU(AM_IP):
     else: self._send_msg(self.smu_mod.PPSMC_MSG_TransferTableSmu2Dram, arg)
     return table_t.from_buffer(bytearray(self.adev.vram.view(self.driver_table_paddr, ctypes.sizeof(table_t))[:]))
 
+  # SmuMetrics is versioned, and the versions agree only up to offset 96: V1 has ThrottlerStatus
+  # there, V2 has AccCnt followed by a 20-byte ThrottlingPercentage, and every field after it
+  # shifts. amdgpu chooses by (MP1 IP version, smc_fw_version) in sienna_cichlid_get_smu_metrics_data
+  # and these are its thresholds verbatim. Choosing wrong does not raise -- it reads the fan speed
+  # out of a padding field -- so the version is looked up rather than assumed.
+  SMU11_METRICS_V2_MIN_FW = {(11,0,7): 0x3A4300, (11,0,11): 0x412D00, (11,0,12): 0x3B2300, (11,0,13): 0x491100}
+  SMU11_METRICS_V3_MIN_FW = {(11,0,7): 0x3A4900}
+
+  @property
+  def smc_fw_version(self) -> int:
+    """The SMU firmware version, asked once. Only the SMU 11 metrics layout depends on it."""
+    if getattr(self, '_smc_fw_version', None) is None:
+      self._smc_fw_version = self._send_msg(self.smu_mod.PPSMC_MSG_GetSmuVersion, 0, read_back_arg=True, timeout=5000)
+    return self._smc_fw_version
+
+  def metrics(self) -> dict[str, int]:
+    """The card's live clocks, activity, power and temperatures, by whatever this SMU calls them.
+
+    SMU 13 keeps temperatures in an AvgTemperature[] indexed by TEMP_*, and the fan in AvgFanRpm.
+    SMU 11 has neither name: they are TemperatureHotspot, TemperatureMem and CurrFanSpeed. Reading
+    an SMU 11 card with SMU 13's names raises AttributeError, and a caller that wraps this in a
+    broad except -- as modeld's ChestnutState did -- then publishes nothing at all and never says
+    why. That is how every clock number on the 6600 XT came to be measured blind.
+
+    CurrClock is the instantaneous per-domain clock indexed by PPCLK_e, which is what tells you
+    whether a SetSoftMin/MaxByFreq the SMU accepted was actually applied. It is the only field
+    here that answers that, so it is reported for every domain, memory included.
+    """
+    ext = self.read_table(self.smu_mod.SmuMetricsExternal_t, self.smu_mod.TABLE_SMU_METRICS)
+    if (ver:=tuple(self.adev.ip_ver[am.MP1_HWIP]))[0] != 11:
+      # SMU 13/14 work today and are what comma ships, so their read keeps its existing shape and
+      # costs no extra round trip. They have no per-domain CurrClock enum in common with SMU 11.
+      m = ext.SmuMetrics
+      return {'gfxclk': m.AverageGfxclkFrequencyPostDs, 'gfx_activity': m.AverageGfxActivity,
+              'socket_power': m.AverageSocketPower, 'temp_hotspot': m.AvgTemperature[self.smu_mod.TEMP_HOTSPOT],
+              'temp_mem': m.AvgTemperature[self.smu_mod.TEMP_MEM], 'fan_rpm': m.AvgFanRpm}
+
+    never = 1 << 62
+    if self.smc_fw_version >= self.SMU11_METRICS_V3_MIN_FW.get(ver, never): m = ext.SmuMetrics_V3
+    elif self.smc_fw_version >= self.SMU11_METRICS_V2_MIN_FW.get(ver, never): m = ext.SmuMetrics_V2
+    else: m = ext.SmuMetrics
+    return {'gfxclk': m.CurrClock[self.smu_mod.PPCLK_GFXCLK], 'socclk': m.CurrClock[self.smu_mod.PPCLK_SOCCLK],
+            'uclk': m.CurrClock[self.smu_mod.PPCLK_UCLK], 'fclk': m.CurrClock[self.smu_mod.PPCLK_FCLK],
+            'gfx_activity': m.AverageGfxActivity, 'uclk_activity': m.AverageUclkActivity,
+            'socket_power': m.AverageSocketPower, 'temp_hotspot': m.TemperatureHotspot,
+            'temp_mem': m.TemperatureMem, 'fan_rpm': m.CurrFanSpeed}
+
   @functools.cache  # pylint: disable=method-cache-max-size-none
   def read_clocks(self, clk_list:tuple[int]) -> dict[int, list[int]]:
     return {clck: [self._send_msg(self.smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clck<<16)|i, read_back_arg=True)&0x7fffffff for i in range(cnt)]
       for clck in clk_list if (cnt:=self._send_msg(self.smu_mod.PPSMC_MSG_GetDpmFreqByIndex, (clck<<16)|0xff, read_back_arg=True)&0x7fffffff)}
 
-  def set_clocks(self, level:int|None):
+  # amdgpu's UMD "profiling" pstate per Navi 2x ASIC, from sienna_cichlid_ppt.h, keyed by MP1 IP
+  # version: (GFXCLK, SOCCLK, MEMCLK) in MHz. These are the clocks AMD themselves validate a part
+  # at. Navy Flounder (11,0,11) is deliberately absent -- the header has no constants for it, and
+  # a guessed memory level is not a slow card, it is a dead one.
+  SMU11_PROFILING_PSTATE = {(11,0,7): (1825, 960, 1000), (11,0,12): (1950, 960, 676), (11,0,13): (2200, 960, 1000)}
+
+  def _set_clocks_smu11(self, level:int|None) -> dict[str, bool]:
+    """SMU 11's clock request, shaped like smu_v11_0_set_performance_level rather than like a
+    sweep over every domain the header defines.
+
+    Three differences from the generic path, each measured on an RX 6600 XT:
+
+    FCLK is never asked. smu_v11_0_set_performance_level sets soft limits on GFXCLK, MCLK and
+    SOCCLK and leaves the Data Fabric clock to PMFW, and this driver asking for it is not a
+    harmless extra.
+
+    Memory is pinned to the ASIC's profiling level, not to the top of its DPM table. On this part
+    the table is [96, 456, 675, 1000] and only 675 can be entered: 456 and 1000 are both accepted
+    in about 1.5 ms and then the SMU never answers another message, under soft-min, hard-min and
+    ceiling-then-floor, with GFXCLK and SOCCLK raised first or not, and with DS_UCLK, DS_FCLK,
+    DF_CSTATE and both memory voltage-scaling features masked off. 675 is what AMD's own
+    DIMGREY_CAVEFISH_UMD_PSTATE_PROFILING_MEMCLK of 676 snaps to. Since AM_POWER_LIMIT is unset in
+    every path except the bench harness, `level=-1` -- the top entry -- is what a normal boot asked
+    for, so a normal boot wedged the SMU.
+
+    GFXCLK gets a ceiling and no floor. Its governor reaches 2340 MHz on its own under load;
+    pinning it to the profiling 1950 measured slower on the same card in the same session.
+
+    The ceiling goes before the floor, which is the order smu_v11_0_set_soft_freq_limited_range
+    uses on every SMU generation.
+    """
+    gfx, soc, uclk = self.smu_mod.PPCLK_GFXCLK, self.smu_mod.PPCLK_SOCCLK, self.smu_mod.PPCLK_UCLK
+    pstate = self.SMU11_PROFILING_PSTATE.get(tuple(self.adev.ip_ver[am.MP1_HWIP]))
+
+    targets: dict[int, tuple[int, int]] = {}
+    if level == 0:
+      # Teardown. (0, 0) is the firmware minimum in the same encoding AUTO uses for the maximum,
+      # so the lowest state is expressed without asking the SMU anything. That matters: fini runs
+      # after a hang as often as after a clean run, read_clocks is cached per clk_list tuple so a
+      # teardown-shaped key is a cache miss, and a miss here puts a GetDpmFreqByIndex round trip on
+      # a possibly-wedged SMU. fini suppresses SMUError but not TimeoutError, so that lookup turned
+      # every post-hang teardown into a 10 s timeout that escaped and buried the real failure.
+      #
+      # Memory is left where it is on purpose: dropping UCLK back to its boot level is the same
+      # transition that wedges it on the way up, and there is nothing to reclaim at teardown.
+      targets[gfx] = targets[soc] = (0, 0)
+    else:
+      # 0xffff is "the firmware maximum" and 0 is "the firmware minimum" -- the encoding
+      # smu_v11_0_set_soft_freq_limited_range uses for AMD_DPM_FORCED_LEVEL_AUTO. Asking that way
+      # costs no DPM-table round trips and leaves both governors free to do their job.
+      targets[gfx] = targets[soc] = (0, 0xffff)
+      # Memory is the exception: it has to land on a specific level, so its table is read. Snap
+      # down, never up -- the level above the validated one is exactly the one that does not work.
+      if pstate and (have:=self.read_clocks((uclk,))).get(uclk) and (fits:=[f for f in have[uclk] if f <= pstate[2]]):
+        targets[uclk] = (max(fits), max(fits))
+
+    took: dict[str, bool] = {}
+    for clck, (fmin, fmax) in targets.items():
+      try:
+        self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | fmax)
+        self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | fmin)
+        took[self.smu_mod.PPCLK_e[clck]] = True
+      except SMUError: took[self.smu_mod.PPCLK_e[clck]] = False
+    return took
+
+  def set_clocks(self, level:int|None) -> dict[str, bool]:
+    """Pin every clock domain -- to `level` in the card's own DPM table, or to max when None.
+
+    Returns {domain name: was the ceiling accepted}, for the domains a ceiling was sent for.
+    Accepted is not the same as applied: a Sienna Cichlid whose pptable still carries a zeroed
+    board section takes every request and stays at its boot clock, because without the VR
+    mapping it has no way to raise a voltage. Only SmuMetrics can tell you the clock moved.
+
+    One domain refusing must not abandon the others. Sienna Cichlid's SMU answers CMD_FAIL for
+    UCLK unless a PPTable has been uploaded, which AM does not do -- and UCLK is first in the
+    list, so a single unguarded raise here left GFXCLK, the domain that decides whether the card
+    runs at boot clocks or boost, never asked at all. On a 6600 XT that was the difference
+    between 262 GFLOPS and the card's actual peak.
+
+    SMUError is the SMU answering "no" about one domain, and is recorded rather than raised.
+    TimeoutError is the SMU not answering -- a fact about the device, not one clock -- and still
+    propagates from the ceiling. The floor keeps suppressing both, as it always has: it is a
+    20 ms best-effort, and the ceiling is what actually pins the clock up.
+    """
+    # SMU 11 has its own shape; see _set_clocks_smu11. SMU 13/14 work today and are what comma
+    # ships, so their message sequence is left exactly as it was.
+    if self.adev.ip_ver[am.MP1_HWIP][0] == 11: return self._set_clocks_smu11(level)
+
     clks = tuple([self.smu_mod.PPCLK_UCLK, self.smu_mod.PPCLK_FCLK, self.smu_mod.PPCLK_SOCCLK])
     if self.adev.ip_ver[am.MP0_HWIP] not in {(13,0,6), (13,0,12)}: clks += (self.smu_mod.PPCLK_GFXCLK,)
 
-    if level is None:
-      for clck in clks:
-        with contextlib.suppress(TimeoutError, SMUError): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16, timeout=20)
-        if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | 0xffff)
-      return
+    # None is "as fast as it will go": floor 0, ceiling 0xffff, which the SMU clamps to the top
+    # DPM state. A level pins floor and ceiling together to one entry of the card's own table.
+    if level is None: targets = {clck: (0, 0xffff) for clck in clks}
+    else: targets = {clck: (vals[level], vals[level]) for clck, vals in self.read_clocks(clks).items()}
 
-    for clck, vals in self.read_clocks(clks).items():
+    took: dict[str, bool] = {}
+    for clck, (fmin, fmax) in targets.items():
       with contextlib.suppress(TimeoutError, SMUError):
-        self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | (vals[level]), timeout=20)
-      if self.adev.ip_ver[am.GC_HWIP] >= (10,0,0): self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | (vals[level]))
+        self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMinByFreq, clck << 16 | fmin, timeout=20)
+      # Pre-gfx10 parts take no ceiling, so there is nothing to report for them and took stays
+      # empty -- distinct from a card that was asked and refused.
+      if self.adev.ip_ver[am.GC_HWIP] < (10,0,0): continue
+      try:
+        self._send_msg(self.smu_mod.PPSMC_MSG_SetSoftMaxByFreq, clck << 16 | fmax)
+        took[self.smu_mod.PPCLK_e[clck]] = True
+      except SMUError: took[self.smu_mod.PPCLK_e[clck]] = False
+    return took
 
   def set_power_limit(self, watts:float):
     ppt_limit = max(int(round(watts)), 1)
@@ -504,7 +772,11 @@ class AM_IH(AM_IP):
       ctx = [getattr(am, f'SOC15_CONTEXT_ID{i}_FROM_IH_ENTRY')(entry) for i in range(4)]
 
       src_name = self.adev.soc.ih_srcs_names.get(client, {}).get(src, '')
-      if src_name in {"SDMA_TRAP", "CP_EOP_INTR"}: continue
+      # CP_EOP_INTERRUPT, not CP_EOP_INTR: no SRCID constant of any generation is spelled the
+      # latter, so end-of-pipe -- the ordinary completion interrupt for every dispatch -- never
+      # matched and fell through to `else: is_err_state = True` below. That is true on gfx9 and
+      # gfx11 as well, not just here.
+      if src_name in {"SDMA_TRAP", "CP_EOP_INTERRUPT"}: continue
 
       print(f"am {self.adev.devfmt}: IH ({rptr:#x}/{wptr['offset']:#x}) client={self.adev.soc.ih_clients.get(client)} src={src_name}({src}) "
             f"ring={ring_id} vmid={vmid}({vmid_type}) pasid={pasid} node={node} ctx=[{ctx[0]:#x}, {ctx[1]:#x}, {ctx[2]:#x}, {ctx[3]:#x}]")

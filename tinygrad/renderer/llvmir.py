@@ -66,6 +66,79 @@ def render_wmma_amd(ctx, wmma: UOp, cdna=False, rdna4=False) -> str:
   return f"  {ctx[wmma]} = call {ldt(_bf16(wmma.dtype), wmma.max_numel())} @llvm.amdgcn.wmma.{dt_map[wmma.src[-1].dtype]}.16x16x16." + \
     f"{dt_map[wmma.arg[1]]}{suffix}(" + ", ".join(args) + ")"
 
+def _lane_of(u:UOp) -> tuple[UOp, int]|None:
+  """(register-vector, lane) if u is one lane of a vector held in registers, else None.
+
+  A lane read renders as `extractelement`, and in UOp form that is an INDEX into an ALU-addrspace
+  value with a constant subscript -- the same shape the base_rewrite rule at the extractelement
+  case matches.
+  """
+  if u.op is Ops.INDEX and len(u.src) == 2 and u.src[1].op is Ops.CONST and u.src[0].addrspace == AddrSpace.ALU:
+    return (u.src[0], u.src[1].val)
+  return None
+
+def _pair_is_free(x:UOp, y:UOp) -> bool:
+  """Whether <2 x half> {x, y} is already the register the hardware would read.
+
+  A <4 x half> load lands in two VGPRs, lanes (0,1) in the first and (2,3) in the second, each as
+  the low and high halves of one dword. So a pair is free exactly when both lanes come from the
+  same vector and are (2k, 2k+1) in that order. Lanes (1,2) straddle two registers and cost a
+  v_alignbit; (1,0) is the same register backwards and costs a swap.
+  """
+  lx, ly = _lane_of(x), _lane_of(y)
+  return lx is not None and ly is not None and lx[0] is ly[0] and lx[1] % 2 == 0 and ly[1] == lx[1] + 1
+
+def _order_dot2_pairs(p0:tuple[UOp, UOp], p1:tuple[UOp, UOp]) -> tuple[tuple[UOp, UOp], tuple[UOp, UOp]]:
+  """Pick the operand order that makes both <2 x half> operands free to form.
+
+  a0*b0 + a1*b1 is invariant under swapping the two products, and each product is invariant under
+  swapping its own factors, so there are four equivalent spellings of the same dot product and
+  nothing forces tinygrad's incoming order to be the useful one. It usually is not: measured on
+  this model's dominant GEMM, half the pairs came out reversed, and reversing a pair turns a
+  register that could be used as-is into a v_mov plus a v_alignbit. That packing tax was 16 of the
+  16 instructions dot2 saved, which is why AMD_DOT2 measured as a wash and was left off.
+
+  Scored rather than assumed: whichever spelling makes the most sides free wins, and if none does
+  the original order is returned unchanged, so this can only remove instructions.
+  """
+  (a0, b0), (a1, b1) = p0, p1
+  best, best_score = ((a0, b0), (a1, b1)), -1
+  for x0, y0 in ((a0, b0), (b0, a0)):
+    for x1, y1 in ((a1, b1), (b1, a1)):
+      for (c0, d0), (c1, d1) in (((x0, y0), (x1, y1)), ((x1, y1), (x0, y0))):
+        score = _pair_is_free(c0, c1) + _pair_is_free(d0, d1)
+        if score > best_score: best, best_score = ((c0, d0), (c1, d1)), score
+  return best
+
+def _amd_dot2(acc:UOp, m0:UOp, m1:UOp) -> UOp|None:
+  """Fold two widened fp16 multiplies sharing an accumulator into one v_dot2c_f32_f16.
+
+  Both multiplies have to be exactly (half -> float) casts of half operands, which is the shape the
+  single-MAC rule leaves behind. Anything else -- a genuine float multiply, a mixed pair, a
+  vectorised operand -- returns None and is left alone, so this can only ever replace a pair it
+  fully understands.
+
+  The result is `a0*b0 + a1*b1 + acc` with every product formed in fp32, against the original
+  `(acc + a0*b0) + a1*b1`. Same operations, one fewer rounding step.
+  """
+  halves = []
+  for m in (m0, m1):
+    if len(m.src) != 2: return None
+    for s in m.src:
+      if s.op is not Ops.CAST or s.dtype is not dtypes.float or s.src[0].dtype is not dtypes.half: return None
+      if s.src[0].max_numel() != 1: return None
+    halves.append((m.src[0].src[0], m.src[1].src[0]))
+  (a0, b0), (a1, b1) = _order_dot2_pairs(*halves)
+  # Ops.STACK carries the element dtype and gets its width from its src count, the same way the
+  # gfx1100 WMMA fixups above build one.
+  def vec(x:UOp, y:UOp) -> UOp: return UOp(Ops.STACK, src=(x, y))
+  # Ops.CUSTOM, not Ops.WMMA: a real WMMA takes its output shape from its accumulator's shape
+  # (uop/ops.py, `wmma output shape = accumulator shape`), and dot2's accumulator is a scalar, so
+  # that node cannot describe it. CUSTOM is the escape hatch for exactly this -- a format string
+  # rendered with its operands -- and the AMD renderer gains one rule to print it.
+  return UOp(Ops.CUSTOM, dtypes.float, (vec(a0, a1), vec(b0, b1), acc),
+             "call float @llvm.amdgcn.fdot2(<2 x half> {0}, <2 x half> {1}, float {2}, i1 false)")
+
 # llvm ops, lop[<dtype>][<op>]
 unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.CDIV: "udiv", Ops.CMOD: "urem",
                  Ops.CMPLT: "icmp ult", Ops.CMPNE: "icmp ne", Ops.CMPEQ: "icmp eq", Ops.OR: "or", Ops.AND: "and", Ops.XOR: "xor",
@@ -277,7 +350,11 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
     self.compiler, self.tensor_cores, self.is_cdna = AMDLLVMCompiler(target.arch), tc.get_amd(target.arch), HIPRenderer.is_cdna(target.arch)
     self.string_rewrite += PatternMatcher([
       (UPat(Ops.WMMA, name="wmma"), lambda ctx, wmma, rdna4=AMDLLVMRenderer.is_rdna4(target.arch), cdna=self.is_cdna:
-        render_wmma_amd(ctx, wmma, cdna, rdna4))
+        render_wmma_amd(ctx, wmma, cdna, rdna4)),
+      # The escape hatch cstyle has had all along (cstyle.py, Ops.CUSTOM/CUSTOMI), which the LLVM
+      # renderer never implemented: render arg as a format string over the operands. Used here to
+      # emit llvm.amdgcn.fdot2, which no combination of fmul/fadd will make LLVM produce.
+      (UPat(Ops.CUSTOM, name="x"), lambda ctx, x: f"  {ctx[x]} = " + x.arg.format(*[ctx[y] for y in x.src])),
     ])
     if self.is_cdna:
       self.extra_matcher += PatternMatcher([
@@ -315,6 +392,56 @@ exit: %packed = phi i32 [%packed_bf8, %do_bf8], [%packed_fp8, %do_fp8]\n  %trunc
         (UPat(Ops.WMMA, name="x", dtype=dtypes.float),
           lambda x: x.replace(src=(x.src[0].bitcast(dtypes.uint16), x.src[1].bitcast(dtypes.uint16), x.src[2]))
           if x.max_numel() == 8 and x.src[0].dtype == dtypes.bfloat16 and x.src[0].max_numel() == 8 else None)
+      ])
+    if target.arch.startswith("gfx10") and getenv("AMD_FMA_MIX", 1):
+      # RDNA1/RDNA2 have no matrix unit -- tc.get_amd returns [] for gfx10* -- so every fp16
+      # multiply-accumulate goes through the generic path, and that path is expensive for a
+      # reason that is fixable here. sum_acc_dtype widens the accumulator to fp32 while the
+      # multiply stays in fp16, so a MAC renders as
+      #     fmul half  ->  fpext half to float  ->  fadd float
+      # and the convert sitting between the multiply and the add blocks the backend from
+      # contracting them. Measured over the big driving model's own compiled kernels that is
+      # 2.88 VALU ops per MAC, against a hardware capability of 0.5.
+      #
+      # Widening both operands BEFORE the multiply lets the AMDGPU backend select a single
+      # v_fma_mix_f32, which takes fp16 sources directly through op_sel and accumulates in fp32:
+      # 10 VALU ops for 8 MACs instead of 23, measured with llc -mcpu=gfx1032. It is also
+      # strictly more accurate -- today's fmul rounds every product to fp16 before adding it,
+      # and this keeps the product in fp32.
+      #
+      # Matched on the ADD, not on the CAST alone, so it only fires where there is an add to
+      # fuse into. A bare (a*b).cast(float) with no accumulate would cost one instruction more
+      # rather than one fewer.
+      # Pair two of those into one v_dot2c_f32_f16 where the shape allows: same fp32 accumulator,
+      # half the instructions again. Listed first so it is tried before the single-MAC rule on the
+      # same node; graph_rewrite runs bottom-up to a fixpoint, so the inner MAC has already been
+      # widened by the rule below and the outer one is widened on an earlier visit to this node.
+      # Whatever does not pair -- an odd trailing MAC, a reduce of length 1 -- still gets the
+      # single-MAC form, so this is strictly additive.
+      # Two sites, because a reduce chain offers both. tinygrad folds the first MAC of each
+      # accumulator into a bare multiply (acc starts at zero), so a 4-deep chain is
+      # m0, +m1, +m2, +m3: the first rule pairs (m0,m1) with no accumulator, the second pairs
+      # (m2,m3) onto whatever the first produced. With only the second rule, one MAC of every four
+      # pairs and the rest fall back to v_fma_mix_f32.
+      dot2 = [
+        (UPat(Ops.ADD, dtypes.float, src=(UPat(Ops.MUL, dtypes.float, name="m0"),
+                                          UPat(Ops.MUL, dtypes.float, name="m1"))),
+         lambda m0, m1: _amd_dot2(UOp.const(0.0, dtypes.float), m0, m1)),
+        (UPat(Ops.ADD, dtypes.float, src=(
+            UPat(Ops.ADD, dtypes.float, src=[UPat.var("acc"), UPat(Ops.MUL, dtypes.float, name="m0")]),
+            UPat(Ops.MUL, dtypes.float, name="m1"))),
+         lambda acc, m0, m1: _amd_dot2(acc, m0, m1)),
+      # Default OFF. It emits what it claims -- 24 v_dot2c_f32_f16 replacing 36 v_fma_mix_f32 plus
+      # the adds, the first time tinygrad has produced that instruction on any AMD target -- but
+      # packing the halves into <2 x half> costs 12 extra v_mov and 4 v_alignbit, so the loop body
+      # only goes 173 -> 164 instructions. That is inside this rig's run-to-run noise and has never
+      # been measured on the card. Enable with AMD_DOT2=1 to measure it; do not ship it on until
+      # someone has.
+      ] if getenv("AMD_DOT2", 0) else []
+      self.extra_matcher += PatternMatcher(dot2 + [
+        (UPat(Ops.ADD, dtypes.float, src=[UPat.var("acc"),
+              UPat(Ops.CAST, dtypes.float, (UPat(Ops.MUL, dtypes.half, name="m"),))]),
+         lambda acc, m: acc + m.src[0].cast(dtypes.float) * m.src[1].cast(dtypes.float)),
       ])
 
   def supported_dtypes(self): return {d for d in super().supported_dtypes()
